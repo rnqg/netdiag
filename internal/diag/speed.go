@@ -114,6 +114,7 @@ func NodeLoad(ctx context.Context, c *node.Client, phase string, streams int, du
 	start := time.Now()
 	var downloaded, uploaded, acknowledged atomic.Int64
 	var confirmedUploads atomic.Int64
+	var uploadElapsed time.Duration
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	failures := []string{}
@@ -225,7 +226,7 @@ func NodeLoad(ctx context.Context, c *node.Client, phase string, streams int, du
 			if rate > 0 {
 				body = &pacedReader{source: reader, pace: throttle}
 			}
-			requestCtx, stopRequest := context.WithDeadline(ctx, start.Add(duration+time.Second))
+			requestCtx, stopRequest := context.WithDeadline(ctx, start.Add(duration+5*time.Second))
 			defer stopRequest()
 			resp, err = streamClient.Request(traced(requestCtx), "POST", "/v1/"+c.Session.ID+"/upload", body)
 			if err == nil {
@@ -235,6 +236,9 @@ func NodeLoad(ctx context.Context, c *node.Client, phase string, streams int, du
 					if n, ok := result["received_bytes"]; ok && n > 0 && n <= supplied.Load() {
 						acknowledged.Add(n)
 						confirmedUploads.Add(1)
+						mu.Lock()
+						uploadElapsed = max(uploadElapsed, time.Since(start))
+						mu.Unlock()
 					}
 				}
 			}
@@ -265,7 +269,9 @@ func NodeLoad(ctx context.Context, c *node.Client, phase string, streams int, du
 		m.Data["download_mbps"] = float64(downloaded.Load()) * 8 / window / 1e6
 	}
 	if window > 0 && phase != "download" && confirmedUploads.Load() == int64(streams) {
-		m.Data["upload_mbps"] = float64(acknowledged.Load()) * 8 / window / 1e6
+		uploadWindow := max(window, uploadElapsed.Seconds())
+		m.Data["upload_mbps"] = float64(acknowledged.Load()) * 8 / uploadWindow / 1e6
+		m.Data["upload_measurement_window_ms"] = uploadWindow * 1000
 	}
 	m.Data["measurement_window_ms"] = window * 1000
 	m.Data["transport"] = "one HTTP/1.1 TCP connection per stream"

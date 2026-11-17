@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,9 +17,20 @@ import (
 
 func loadFixture(t *testing.T) *node.Client {
 	t.Helper()
+	return loadFixtureWithAckDelay(t, 0)
+}
+
+func loadFixtureWithAckDelay(t *testing.T, delay time.Duration) *node.Client {
+	t.Helper()
 	token := "0123456789abcdef0123456789abcdef"
 	service := node.NewServer(token, 4444, 4<<20)
-	server := httptest.NewUnstartedServer(service)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if delay > 0 && strings.HasSuffix(r.URL.Path, "/upload") {
+			w = delayedUploadAck{ResponseWriter: w, delay: delay}
+		}
+		service.ServeHTTP(w, r)
+	})
+	server := httptest.NewUnstartedServer(handler)
 	server.EnableHTTP2 = true
 	server.StartTLS()
 	t.Cleanup(server.Close)
@@ -49,6 +61,28 @@ func TestNodeLoadHonorsBudgetAndAcknowledgesUpload(t *testing.T) {
 				t.Fatalf("upload not acknowledged: %+v", m)
 			}
 		})
+	}
+}
+
+type delayedUploadAck struct {
+	http.ResponseWriter
+	delay time.Duration
+}
+
+func (w delayedUploadAck) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w delayedUploadAck) Write(p []byte) (int, error) {
+	time.Sleep(w.delay)
+	return w.ResponseWriter.Write(p)
+}
+
+func TestUploadWaitsForConfirmationAndIncludesDrainTime(t *testing.T) {
+	c := loadFixtureWithAckDelay(t, 1500*time.Millisecond)
+	m := NodeLoad(context.Background(), c, "upload", 1, 2*time.Second, NewBudget(1<<20), 64<<10)
+	window := number(m.Data["upload_measurement_window_ms"])
+	acknowledged := number(m.Data["acknowledged_upload_bytes"])
+	if m.Status != "ok" || window < 3000 || acknowledged <= 0 || number(m.Data["upload_mbps"]) >= acknowledged*8/2/1e6 {
+		t.Fatalf("late confirmation lost or throughput overstated: %+v", m)
 	}
 }
 
