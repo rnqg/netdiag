@@ -48,6 +48,10 @@ func (c *Client) StreamClient() *Client {
 		tr = tr.Clone()
 		tr.ForceAttemptHTTP2 = false
 		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		if tr.TLSClientConfig == nil {
+			tr.TLSClientConfig = &tls.Config{}
+		}
+		tr.TLSClientConfig.NextProtos = []string{"http/1.1"}
 		tr.DisableKeepAlives = true
 		copyHTTP.Transport = tr
 	}

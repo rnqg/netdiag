@@ -18,7 +18,9 @@ func loadFixture(t *testing.T) *node.Client {
 	t.Helper()
 	token := "0123456789abcdef0123456789abcdef"
 	service := node.NewServer(token, 4444, 4<<20)
-	server := httptest.NewTLSServer(service)
+	server := httptest.NewUnstartedServer(service)
+	server.EnableHTTP2 = true
+	server.StartTLS()
 	t.Cleanup(server.Close)
 	c, err := node.NewClient(server.URL, token)
 	if err != nil {
