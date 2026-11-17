@@ -1,0 +1,14 @@
+*
+!go.mod
+!go.sum
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!cmd/
+!cmd/netdiag-node/
+!cmd/netdiag-node/*.go
+!internal/
+!internal/node/
+!internal/node/*.go
+internal/node/*_test.go
+internal/node/*_windows.go
+internal/node/*_darwin.go
