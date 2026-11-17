@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const Version = "0.1.2"
+const Version = "0.1.3"
 const Schema = 1
 
 type Target struct {
@@ -149,6 +149,7 @@ type Report struct {
 	Findings       []Finding         `json:"findings"`
 	Partial        bool              `json:"partial"`
 	NetworkChanged bool              `json:"network_changed"`
+	Full           bool              `json:"full,omitempty"`
 	Methods        map[string]string `json:"methods"`
 }
 
@@ -166,7 +167,7 @@ type Options struct {
 }
 
 func NewReport(command string, opts Options) Report {
-	return Report{Schema: Schema, Version: Version, Catalog: "2026-11-17.1", Rules: "1", Started: time.Now().UTC(), Command: command, Mode: opts.Mode, Profile: opts.Profile, Environment: Inspect(), Targets: opts.Targets, Measurements: []Measurement{}, Findings: []Finding{}, Methods: map[string]string{
+	return Report{Schema: Schema, Version: Version, Catalog: "2026-11-17.1", Rules: "2", Started: time.Now().UTC(), Command: command, Mode: opts.Mode, Profile: opts.Profile, Environment: Inspect(), Targets: opts.Targets, Measurements: []Measurement{}, Findings: []Finding{}, Methods: map[string]string{
 		"rtt":         "ICMP или аутентифицированный UDP echo; время соединения и HTTP учитывается отдельно",
 		"jitter":      "mean(abs(RTT[i]-RTT[i-1])) только для последовательных успешных проб",
 		"percentile":  "nearest-rank; p99 при числе успешных проб >= 100",

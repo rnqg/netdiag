@@ -3,15 +3,16 @@ package diag
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 func Analyze(r Report) []Finding {
 	f := []Finding{}
-	if r.Command == "quality" {
+	if r.Command == "quality" || r.Full {
 		received := 0
 		var evidence []string
 		for _, m := range r.Measurements {
-			if (m.Kind == "udp_rtt" || m.Kind == "icmp_rtt") && m.Target != "local-gateway" {
+			if (m.Kind == "udp_rtt" || m.Kind == "icmp_rtt") && m.Target != "local-gateway" && (!r.Full || strings.HasPrefix(m.ID, "quality/")) {
 				evidence = append(evidence, m.ID)
 				if m.Stats != nil {
 					received += m.Stats.Received
@@ -24,14 +25,14 @@ func Analyze(r Report) []Finding {
 	}
 	dnsFailures := map[string][]string{}
 
-	if r.Command == "speed" {
-		missingLoad := false
+	if r.Command == "speed" || r.Full {
+		completeLoad := 0
 		for _, m := range r.Measurements {
-			if m.Kind == "bufferbloat" && m.Status != "ok" {
-				missingLoad = true
+			if m.Kind == "bufferbloat" && m.Status == "ok" {
+				completeLoad++
 			}
 		}
-		if missingLoad {
+		if completeLoad < 3 {
 			f = append(f, Finding{Code: "bufferbloat_not_measured", Severity: "info", Confidence: "observed", Summary: "Не все проверки задержки под нагрузкой выполнены", Next: "Для полного теста нужен свой --node, достаточный лимит трафика и ответы на UDP-пробы. Причины пропуска сохранены в измерениях."})
 		}
 		measured := false
@@ -80,7 +81,10 @@ func Analyze(r Report) []Finding {
 		if m.Kind == "solution_trial" && m.Status == "ok" {
 			next := "Вариант с другим DNS сработал в трёх чередующихся испытаниях. Различия адресов CDN тоже могут влиять на результат."
 			fix := ""
-			if eligible, _ := m.Data["automatic_eligible"].(bool); eligible {
+			if m.Data["tcp_fallback"] == true {
+				next = "Ответ получен после повторного DNS-запроса по TCP. Проверьте, поддерживает ли выбранный резолвер такой режим."
+			}
+			if eligible, _ := m.Data["automatic_eligible"].(bool); eligible && !r.NetworkChanged {
 				fix = "dns"
 				next = "Проверена смена DNS на " + fmt.Sprint(m.Data["resolver_ip"]) + ". Доступны инструкция и автоматическое исправление с подтверждением и откатом."
 			}

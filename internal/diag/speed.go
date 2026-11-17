@@ -329,6 +329,7 @@ func RunNodeSpeed(ctx context.Context, opts Options) Report {
 		return r
 	}
 	defer c.Close()
+	observePeerRoute(ctx, c.Peer)
 	control, err := c.NewSession(ctx, controlBudget, 600)
 	if err != nil {
 		r.Measurements = append(r.Measurements, Measurement{Kind: "node", Status: "unavailable", Reason: "control_session_unavailable"})

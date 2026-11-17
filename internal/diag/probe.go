@@ -68,6 +68,7 @@ func Probe(ctx context.Context, target Target, cfg ProbeConfig) Measurement {
 	var mu sync.Mutex
 	var dnsStart, tcpStart, tlsStart time.Time
 	attempts := map[string]time.Time{}
+	var selected net.Conn
 	trace := &httptrace.ClientTrace{
 		DNSStart: func(httptrace.DNSStartInfo) { mu.Lock(); dnsStart = time.Now(); mu.Unlock() },
 		DNSDone: func(v httptrace.DNSDoneInfo) {
@@ -126,8 +127,10 @@ func Probe(ctx context.Context, target Target, cfg ProbeConfig) Measurement {
 			if addr, ok := i.Conn.RemoteAddr().(*net.TCPAddr); ok {
 				data["peer_ip"] = addr.IP.String()
 			}
+			selected = i.Conn
 			data["tcp_kernel"] = TCPStats(i.Conn)
 			data["tcp_kernel_sample_scope"] = "connection_ready"
+			data["tcp_peer_scope"] = "socket_peer; local proxy or tunnel may terminate TCP"
 			delete(data, "failure_stage")
 		},
 		GotFirstResponseByte: func() {
@@ -248,8 +251,19 @@ func Probe(ctx context.Context, target Target, cfg ProbeConfig) Measurement {
 	}
 	mu.Unlock()
 	if resp != nil {
-		_, bodyErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 65536))
+		mu.Lock()
+		conn := selected
+		mu.Unlock()
+		sink := &responseSample{conn: conn}
+		count, bodyErr := io.Copy(sink, io.LimitReader(resp.Body, 65536))
 		resp.Body.Close()
+		mu.Lock()
+		data["body_sample_bytes"] = count
+		if sink.stats != nil {
+			data["tcp_kernel_after_body"] = sink.stats
+			data["tcp_kernel_body_offset_bytes"] = sink.sampledAt
+		}
+		mu.Unlock()
 		if bodyErr != nil && m.Status == "ok" {
 			mu.Lock()
 			m.Status = "failed"
@@ -287,7 +301,28 @@ func Probe(ctx context.Context, target Target, cfg ProbeConfig) Measurement {
 	mu.Unlock()
 	m.Data = snapshot
 	m.DurationMS = float64(time.Since(start).Microseconds()) / 1000
+	if peer, ok := snapshot["peer_ip"].(string); ok {
+		observePeerRoute(ctx, peer)
+	}
 	return m
+}
+
+type responseSample struct {
+	conn            net.Conn
+	stats           map[string]any
+	read, sampledAt int64
+}
+
+func (s *responseSample) Write(p []byte) (int, error) {
+	s.read += int64(len(p))
+	if len(p) > 0 && s.conn != nil {
+		stats := TCPStats(s.conn)
+		if stats["status"] == "ok" || s.stats == nil {
+			s.stats = stats
+			s.sampledAt = s.read
+		}
+	}
+	return len(p), nil
 }
 
 func h3Port(value string) string {

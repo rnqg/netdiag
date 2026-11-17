@@ -23,6 +23,7 @@ const help = `netdiag — диагностика сети
 
   netdiag
   netdiag check --mode direct --profile deep --output report.json
+  netdiag check --mode direct --full --node https://node.example.org:8443
   netdiag check --mode vpn --target example.org --verbose
   netdiag quality --mode direct --duration 60s
   netdiag speed --mode direct --node https://node.example.org:8443
@@ -31,10 +32,12 @@ const help = `netdiag — диагностика сети
   netdiag report --input report.json --verbose
   netdiag fix --input report.json
   netdiag fix --input report.json --apply
+  netdiag fix --flush-cache --input report.json --apply
 
 Параметры:
   --mode direct|vpn       Подтверждённый пользователем режим
   --profile quick|deep    Глубина проверки, по умолчанию deep
+  --full                 Добавить качество, скорость и буферблоат к check (нужен --node)
   --target домен          Добавить цель; путь, пароль и параметры URL не используются
   --only-target           Проверять только указанные цели
   --duration 60s          Продолжительность замера качества (2s..5m)
@@ -93,6 +96,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 	maxMiB := fs.Int64("max-mib", 1024, "")
 	consent := fs.Bool("accept-mlab-policy", false, "")
 	trace := fs.Bool("trace", false, "")
+	full := fs.Bool("full", false, "")
 	format := fs.String("format", "text", "")
 	output := fs.String("output", "", "")
 	verbose := fs.Bool("verbose", false, "")
@@ -117,6 +121,10 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 	}
 	if *format != "text" && *format != "json" {
 		fmt.Fprintln(errOut, "Формат: text или json.")
+		return 2
+	}
+	if *full && (command != "check" || *nodeURL == "" || *profile != "deep") {
+		fmt.Fprintln(errOut, "Для --full нужны команда check, профиль deep и свой --node.")
 		return 2
 	}
 	if command == "report" {
@@ -147,6 +155,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 		var err error
 		if *flush {
 			plan = fix.Plan{Action: "flush"}
+			plan.Target, err = flushVerificationTarget(*input, targetArgs)
 		} else {
 			var r diag.Report
 			r, err = ReadReport(*input)
@@ -191,9 +200,17 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 			fmt.Fprintln(out, "Изменения не выполнялись.")
 			return 0
 		}
+		var before diag.Measurement
+		if plan.Action == "flush" && plan.Target != "" {
+			before = diag.Probe(ctx, diag.Target{URL: plan.Target}, diag.ProbeConfig{})
+		}
 		if err = fix.Launch(ctx, plan); err != nil {
 			fmt.Fprintln(errOut, err)
 			return 1
+		}
+		if before.Kind != "" {
+			after := diag.Probe(ctx, diag.Target{URL: plan.Target}, diag.ProbeConfig{})
+			return printFlushVerification(out, plan.Target, before, after)
 		}
 		return 0
 	}
@@ -249,7 +266,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 		}
 		*consent = true
 	}
-	if command == "speed" && interactive {
+	if (command == "speed" || *full) && interactive {
 		if ask(fmt.Sprintf("Нагрузочный тест: до %d МиБ тестовых данных и служебный трафик. Продолжить? да: ", *maxMiB), "") != "да" {
 			return 0
 		}
@@ -264,14 +281,19 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 		}
 	}
 	var r diag.Report
+	comparedFull := false
 	run, cancel := context.WithCancel(ctx)
-	stopMonitor := diag.MonitorNetwork(run, cancel)
+	run, stopMonitor := diag.MonitorNetwork(run, cancel)
 	defer stopMonitor()
 	defer cancel()
 	ctx = run
 	switch command {
 	case "check":
-		r = diag.RunCheck(ctx, opts)
+		if *full {
+			r = diag.RunFull(ctx, opts)
+		} else {
+			r = diag.RunCheck(ctx, opts)
+		}
 	case "quality":
 		r = diag.RunQuality(ctx, opts)
 	case "speed":
@@ -307,11 +329,15 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 		opts.Profile = previous.Profile
 		r = diag.RunCheck(ctx, opts)
 		Compare(previous, &r)
+		comparedFull = previous.Full
 	}
 	if stopMonitor() {
 		r.NetworkChanged = true
 		r.Partial = true
 		r.Findings = diag.Analyze(r)
+	}
+	if comparedFull {
+		r.Findings = append(r.Findings, diag.Finding{Code: "comparison_without_load", Severity: "info", Confidence: "observed", Summary: "Сравнены проверки доступности", Next: "Задержка под нагрузкой и скорость измеряются отдельным запуском check --full."})
 	}
 	return emit(out, errOut, r, *format, *output, *verbose)
 }

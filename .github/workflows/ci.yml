@@ -46,6 +46,67 @@ jobs:
           for target_arch in amd64 arm64; do
             GOARCH="$target_arch" CGO_ENABLED=0 go build -trimpath -buildvcs=false -o "$TASK_TEMP/bin/$target_arch/" ./cmd/...
           done
+      - name: Check full report against the containerized node
+        if: runner.os == 'Linux'
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          fixture="$TASK_TEMP/container"
+          mkdir -p "$fixture"
+          image="netdiag-check:$GITHUB_RUN_ID"
+          container="netdiag-check-$GITHUB_RUN_ID"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true; docker image rm "$image" >/dev/null 2>&1 || true' EXIT
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
+            -addext 'subjectAltName=IP:127.0.0.1' -out "$fixture/cert.pem" -keyout "$fixture/key.pem" 2>/dev/null
+          chmod a+r "$fixture/cert.pem" "$fixture/key.pem"
+          export NETDIAG_NODE_TOKEN
+          NETDIAG_NODE_TOKEN=$(openssl rand -hex 32)
+          docker build -q -t "$image" .
+          docker run -d --name "$container" --network host --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --env NETDIAG_NODE_TOKEN \
+            --mount "type=bind,source=$fixture/cert.pem,target=/cert.pem,readonly" \
+            --mount "type=bind,source=$fixture/key.pem,target=/key.pem,readonly" \
+            "$image" --listen 127.0.0.1:0 --udp 127.0.0.1:0 --cert /cert.pem --key /key.pem --max-mib 16
+          endpoint=""
+          for attempt in $(seq 1 20); do
+            endpoint=$(docker logs "$container" 2>&1 | sed -n 's/.*HTTPS.* \(127\.0\.0\.1:[0-9][0-9]*\);.*/\1/p')
+            if [ -n "$endpoint" ]; then break; fi
+            sleep 1
+          done
+          test -n "$endpoint"
+          status=$(curl -sS --noproxy '*' --cacert "$fixture/cert.pem" -o /dev/null -w '%{http_code}' "https://$endpoint/v1/capabilities")
+          test "$status" = 401
+          mkdir "$fixture/web"
+          python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$fixture/web" >"$fixture/http.log" 2>&1 &
+          web_pid=$!
+          trap 'kill "$web_pid" 2>/dev/null || true; docker rm -f "$container" >/dev/null 2>&1 || true; docker image rm "$image" >/dev/null 2>&1 || true' EXIT
+          web_port=""
+          for attempt in $(seq 1 20); do
+            web_port=$(sed -n 's/.* port \([0-9][0-9]*\) .*/\1/p' "$fixture/http.log")
+            if [ -n "$web_port" ]; then break; fi
+            sleep 1
+          done
+          test -n "$web_port"
+          code=0
+          SSL_CERT_FILE="$fixture/cert.pem" "$TASK_TEMP/bin/amd64/netdiag" check --full --mode direct \
+            --only-target --target "http://127.0.0.1:$web_port" --node "https://$endpoint" \
+            --max-mib 16 --duration 2s --format json > "$fixture/report.json" || code=$?
+          python3 - "$fixture/report.json" "$code" <<'PYVERIFY'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as report:
+              data = json.load(report)
+          rows = data["measurements"]
+          assert sys.argv[2] == "3" and data["full"] and data["partial"], data["findings"]
+          assert not data["network_changed"], data["findings"]
+          assert any(row["kind"] == "http_baseline" and row["status"] == "ok" for row in rows)
+          assert any(row["id"] == "quality/quality-udp" and row["statistics"]["received"] > 0 for row in rows)
+          phases = [row for row in rows if row["kind"] == "bufferbloat"]
+          assert {row["data"]["phase"] for row in phases} == {"download", "upload", "both"}, phases
+          assert any(row["kind"] == "throughput" and row["status"] == "limited" for row in rows)
+          assert len({row["id"] for row in rows}) == len(rows)
+          PYVERIFY
       - name: Clean temporary workspace
         if: always()
         run: |

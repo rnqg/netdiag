@@ -59,6 +59,9 @@ func TestTLSVerificationAndHTTP2(t *testing.T) {
 	if m.Status != "ok" || m.Data["protocol"] != "HTTP/2.0" {
 		t.Fatalf("h2 failed: %+v", m)
 	}
+	if m.Data["body_sample_bytes"] != int64(2) || m.Data["tcp_kernel_body_offset_bytes"] != int64(2) || m.Data["tcp_kernel_after_body"] == nil {
+		t.Fatalf("missing TCP sample after reading body: %+v", m)
+	}
 	m = Probe(context.Background(), Target{URL: server.URL}, ProbeConfig{Protocol: "h1", Roots: roots, TLSVersion: tls.VersionTLS12})
 	if m.Status != "ok" || m.Data["protocol"] != "HTTP/1.1" || m.Data["tls_version"] != "TLS 1.2" {
 		t.Fatalf("h1/TLS12 failed: %+v", m)

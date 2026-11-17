@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -62,64 +64,86 @@ func QueryDNS(ctx context.Context, host string, r Resolver, method string, qtype
 	msg.SetQuestion(dns.Fqdn(host), qtype)
 	var reply *dns.Msg
 	var err error
+	stage := "dns_exchange"
 	if method == "doh" {
 		tr := newDoHTransport(r.IP)
 		defer tr.CloseIdleConnections()
+		var tcpReady, tlsReady atomic.Bool
+		trace := &httptrace.ClientTrace{
+			ConnectDone: func(_, _ string, err error) {
+				if err == nil {
+					tcpReady.Store(true)
+				}
+			},
+			TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+				if err == nil {
+					tlsReady.Store(true)
+				}
+			},
+		}
 		var protocol string
-		reply, protocol, err = exchangeDoH(ctx, msg, r.DoH, tr)
+		reply, protocol, err = exchangeDoH(httptrace.WithClientTrace(ctx, trace), msg, r.DoH, tr)
+		switch {
+		case tlsReady.Load():
+			stage = "dns_http"
+		case tcpReady.Load():
+			stage = "dns_tls"
+		default:
+			stage = "dns_connect"
+		}
 		if protocol != "" {
 			m.Data["http_protocol"] = protocol
 		}
 	} else {
-		network := method
-		port := "53"
-		if r.Port != "" {
-			port = r.Port
+		port := r.Port
+		if port == "" {
+			port = "53"
+			if method == "dot" {
+				port = "853"
+			}
 		}
-		var tc *tls.Config
-		if method == "dot" {
-			network = "tcp-tls"
-			port = "853"
-			tc = &tls.Config{ServerName: r.DoT, MinVersion: tls.VersionTLS12}
-		}
-		client := &dns.Client{Net: network, Timeout: 3 * time.Second, TLSConfig: tc}
-		reply, _, err = client.ExchangeContext(ctx, msg, net.JoinHostPort(r.IP, port))
-		if err == nil && reply.Truncated && method == "udp" {
-			client.Net = "tcp"
-			reply, _, err = client.ExchangeContext(ctx, msg, net.JoinHostPort(r.IP, port))
+		address := net.JoinHostPort(r.IP, port)
+		reply, stage, err = exchangeDNS(ctx, msg, address, method, r.DoT)
+		if err == nil && reply != nil && reply.Truncated && method == "udp" && validDNSReply(msg, reply) {
+			reply, stage, err = exchangeDNS(ctx, msg, address, "tcp", "")
 			m.Data["tcp_fallback"] = true
 		}
 	}
-	ips := []net.IP{}
-	if err != nil {
+	var ips []net.IP
+	switch {
+	case err != nil:
 		m.Reason = ErrorCode(err)
-		m.Data["failure_stage"] = "dns_transport"
+		m.Data["failure_stage"] = stage
 		var responseErr *dnsResponseError
 		if errors.As(err, &responseErr) {
 			m.Reason = responseErr.reason
 			m.Data["http_status"] = responseErr.status
 			m.Data["failure_stage"] = "dns_response"
 		}
-	} else if reply == nil || !reply.Response || reply.Id != msg.Id || len(reply.Question) != 1 || reply.Question[0].Name != msg.Question[0].Name || reply.Question[0].Qtype != qtype || reply.Question[0].Qclass != msg.Question[0].Qclass {
+	case !validDNSReply(msg, reply) || reply.Truncated:
 		m.Reason = "dns_invalid_response"
-	} else {
+		m.Data["failure_stage"] = "dns_response"
+	default:
 		m.Data["rcode"] = dns.RcodeToString[reply.Rcode]
-		for _, rr := range reply.Answer {
-			switch v := rr.(type) {
-			case *dns.A:
-				if qtype == dns.TypeA {
-					ips = append(ips, v.A)
-				}
-			case *dns.AAAA:
-				if qtype == dns.TypeAAAA {
-					ips = append(ips, v.AAAA)
+		if reply.Rcode == dns.RcodeSuccess {
+			for _, rr := range reply.Answer {
+				switch v := rr.(type) {
+				case *dns.A:
+					if qtype == dns.TypeA {
+						ips = append(ips, v.A)
+					}
+				case *dns.AAAA:
+					if qtype == dns.TypeAAAA {
+						ips = append(ips, v.AAAA)
+					}
 				}
 			}
 		}
-		if reply.Rcode == dns.RcodeSuccess && len(ips) > 0 {
+		if len(ips) > 0 {
 			m.Status = "ok"
 		} else {
 			m.Reason = "dns_" + dns.RcodeToString[reply.Rcode]
+			m.Data["failure_stage"] = "dns_response"
 			if reply.Rcode == dns.RcodeSuccess {
 				m.Status = "unavailable"
 				m.Reason = "dns_nodata"
@@ -133,6 +157,38 @@ func QueryDNS(ctx context.Context, host string, r Resolver, method string, qtype
 	m.Data["addresses"] = values
 	m.DurationMS = float64(time.Since(start).Microseconds()) / 1000
 	return m, ips
+}
+
+func validDNSReply(msg, reply *dns.Msg) bool {
+	return reply != nil && reply.Response && reply.Id == msg.Id && len(reply.Question) == 1 && reply.Question[0] == msg.Question[0]
+}
+
+func exchangeDNS(ctx context.Context, msg *dns.Msg, address, method, serverName string) (*dns.Msg, string, error) {
+	network := method
+	if method == "dot" {
+		network = "tcp"
+	}
+	client := &dns.Client{Net: network, Timeout: 3 * time.Second}
+	conn, err := client.DialContext(ctx, address)
+	if err != nil {
+		return nil, "dns_connect", err
+	}
+	connUnderlay := conn.Conn
+	defer connUnderlay.Close()
+	stop := context.AfterFunc(ctx, func() { connUnderlay.Close() })
+	defer stop()
+	if method == "dot" {
+		secured := tls.Client(conn.Conn, &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12})
+		if err := secured.HandshakeContext(ctx); err != nil {
+			return nil, "dns_tls", err
+		}
+		conn.Conn = secured
+	}
+	reply, _, err := client.ExchangeWithConnContext(ctx, msg, conn)
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	return reply, "dns_exchange", err
 }
 
 func newDoHTransport(ip string) *http.Transport {

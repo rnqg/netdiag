@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -148,5 +149,31 @@ func TestDNSFailureAppearsInFindings(t *testing.T) {
 	findings := Analyze(r)
 	if len(findings) != 1 || findings[0].Code != "dns_transport_failed" || len(findings[0].Evidence) != 1 {
 		t.Fatal(findings)
+	}
+}
+
+func TestDNSTrialQueriesResolverAgainAndIgnoresRefusedAnswers(t *testing.T) {
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	server := &dns.Server{PacketConn: conn, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		if calls.Add(1) > 1 {
+			m.Rcode = dns.RcodeRefused
+		}
+		m.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.IPv4(127, 0, 0, 1)}}
+		w.WriteMsg(m)
+	})}
+	go server.ActivateAndServe()
+	defer server.Shutdown()
+	web := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok") }))
+	defer web.Close()
+	_, port, _ := net.SplitHostPort(conn.LocalAddr().String())
+	result := testDNSAlternative(context.Background(), Target{URL: web.URL}, "example.test", Resolver{IP: "127.0.0.1", Port: port}, "udp")
+	if len(result) != 5 || calls.Load() != 2 || result[3].Reason != "dns_REFUSED" || len(measurementIPs(result[3])) > 0 || result[4].Status != "inconclusive" {
+		t.Fatalf("resolver failure was not reflected in trial: %+v", result)
 	}
 }

@@ -81,6 +81,42 @@ func RunCheck(ctx context.Context, opts Options) Report {
 	return r
 }
 
+func RunFull(ctx context.Context, opts Options) Report {
+	r := RunCheck(ctx, opts)
+	r.Full = true
+	if !r.NetworkChanged && ctx.Err() == nil {
+		qualityOptions := opts
+		qualityOptions.MaxBytes = min(opts.MaxBytes/8, 2<<20)
+		if opts.Progress != nil {
+			opts.Progress("Качество подключения и размеры пакетов")
+		}
+		quality := RunQuality(ctx, qualityOptions)
+		appendSection := func(section Report) {
+			for _, m := range section.Measurements {
+				m.ID = section.Command + "/" + m.ID
+				r.Measurements = append(r.Measurements, m)
+			}
+			r.NetworkChanged = r.NetworkChanged || section.NetworkChanged || !SameNetwork(r.Environment, section.Environment)
+			r.Partial = r.Partial || section.Partial
+		}
+		appendSection(quality)
+		if !r.NetworkChanged && ctx.Err() == nil {
+			speedOptions := opts
+			speedOptions.MaxBytes -= qualityOptions.MaxBytes
+			appendSection(RunNodeSpeed(ctx, speedOptions))
+		}
+	}
+	complete := 0
+	for _, m := range r.Measurements {
+		if m.Kind == "bufferbloat" && m.Status == "ok" {
+			complete++
+		}
+	}
+	r.Partial = r.Partial || complete < 3
+	r.Finish(ctx.Err())
+	return r
+}
+
 func checkTarget(ctx context.Context, target Target, profile string) []Measurement {
 	u, _ := url.Parse(target.URL)
 	result := []Measurement{Resolve(ctx, u.Hostname())}
@@ -149,17 +185,12 @@ func checkTarget(ctx context.Context, target Target, profile string) []Measureme
 		result = append(result, transportTrials(ctx, target, result, pinned)...)
 	}
 	if base.Status == "failed" && ctx.Err() == nil && net.ParseIP(u.Hostname()) == nil {
-		for _, resolver := range Resolvers {
-			for _, method := range []string{"udp", "tcp", "doh", "dot"} {
+		for _, method := range []string{"udp", "tcp", "doh", "dot"} {
+			for _, resolver := range Resolvers {
 				if ctx.Err() != nil {
 					return result
 				}
-				d, ips := QueryDNS(ctx, u.Hostname(), resolver, method, dns.TypeA)
-				result = append(result, d)
-				if len(ips) == 0 {
-					continue
-				}
-				trial := testDNSAlternative(ctx, target, resolver, method, ips)
+				trial := testDNSAlternative(ctx, target, u.Hostname(), resolver, method)
 				result = append(result, trial...)
 				if len(trial) > 0 && trial[len(trial)-1].Status == "ok" {
 					return result
@@ -193,7 +224,7 @@ func dnsMatrix(ctx context.Context, host string, ipv6 bool) []Measurement {
 			}
 		}
 	}
-	results := make([]Measurement, len(tasks))
+	results := make([][]Measurement, len(tasks))
 	var wg sync.WaitGroup
 	slots := make(chan struct{}, 6)
 	for i, job := range tasks {
@@ -203,7 +234,7 @@ func dnsMatrix(ctx context.Context, host string, ipv6 bool) []Measurement {
 			select {
 			case slots <- struct{}{}:
 			case <-ctx.Done():
-				results[i] = Measurement{ID: fmt.Sprintf("dns-matrix-%02d", i), Kind: "dns_alternative", Target: host, Status: "unavailable", Reason: "deadline"}
+				results[i] = []Measurement{{ID: fmt.Sprintf("dns-matrix-%02d-1", i), Kind: "dns_alternative", Target: host, Status: "unavailable", Reason: "deadline", Data: map[string]any{"resolver": job.resolver.Name, "resolver_ip": job.resolver.IP, "method": job.method}}}
 				return
 			}
 			defer func() { <-slots }()
@@ -213,23 +244,36 @@ func dnsMatrix(ctx context.Context, host string, ipv6 bool) []Measurement {
 				queryHost = "netdiag-negative.invalid"
 				qtype = dns.TypeA
 			}
-			m, _ := QueryDNS(ctx, queryHost, job.resolver, job.method, qtype)
-			if job.qtype == 0 {
-				m.Data["negative_control"] = true
-				if m.Reason == "dns_NXDOMAIN" {
-					m.Status = "ok"
-					m.Reason = ""
-				} else if m.Status == "ok" || m.Reason == "dns_nodata" {
-					m.Status = "failed"
-					m.Reason = "dns_negative_control_unexpected"
-				}
+			count := 1
+			if job.qtype == dns.TypeA {
+				count = 2
 			}
-			m.ID = fmt.Sprintf("dns-matrix-%02d", i)
-			results[i] = m
+			for attempt := 1; attempt <= count && ctx.Err() == nil; attempt++ {
+				m, _ := QueryDNS(ctx, queryHost, job.resolver, job.method, qtype)
+				m.Data["attempt"] = attempt
+				if job.qtype == 0 {
+					m.Data["negative_control"] = true
+					if m.Reason == "dns_NXDOMAIN" {
+						m.Status = "ok"
+						m.Reason = ""
+						delete(m.Data, "failure_stage")
+					} else if m.Status == "ok" || m.Reason == "dns_nodata" {
+						m.Status = "failed"
+						m.Reason = "dns_negative_control_unexpected"
+						m.Data["failure_stage"] = "dns_response"
+					}
+				}
+				m.ID = fmt.Sprintf("dns-matrix-%02d-%d", i, attempt)
+				results[i] = append(results[i], m)
+			}
 		}(i, job)
 	}
 	wg.Wait()
-	return results
+	var measurements []Measurement
+	for _, result := range results {
+		measurements = append(measurements, result...)
+	}
+	return measurements
 }
 
 func transportTrials(ctx context.Context, target Target, measurements []Measurement, pinned []net.IP) []Measurement {
@@ -274,10 +318,19 @@ func transportTrials(ctx context.Context, target Target, measurements []Measurem
 	return append(values, Measurement{Kind: "transport_solution", Target: target.URL, Status: status, Data: map[string]any{"failed_protocol": failed, "working_protocol": working, "candidate_successes": successes, "baseline_failures": failures, "rounds": 3, "same_ip": true, "system_unchanged": true}})
 }
 
-func testDNSAlternative(ctx context.Context, t Target, r Resolver, method string, ips []net.IP) []Measurement {
+func testDNSAlternative(ctx context.Context, t Target, host string, r Resolver, method string) []Measurement {
 	values := []Measurement{}
 	passed, failed, dnsFailed := 0, 0, 0
+	tcpFallback := false
 	for round := 0; round < 3 && ctx.Err() == nil; round++ {
+		query, ips := QueryDNS(ctx, host, r, method, dns.TypeA)
+		query.Data["attempt"] = round + 1
+		query.Data["solution_trial"] = true
+		values = append(values, query)
+		if query.Status != "ok" {
+			break
+		}
+		tcpFallback = tcpFallback || query.Data["tcp_fallback"] == true
 		base := Probe(ctx, t, ProbeConfig{Protocol: "auto"})
 		base.Kind = "trial_baseline"
 		values = append(values, base)
@@ -302,7 +355,7 @@ func testDNSAlternative(ctx context.Context, t Target, r Resolver, method string
 	if passed == 3 && failed == 3 {
 		status = "ok"
 	}
-	m := Measurement{Kind: "solution_trial", Target: t.URL, Status: status, Started: time.Now().UTC(), Data: map[string]any{"candidate": "dns", "resolver_ip": r.IP, "resolver": r.Name, "dns_method": method, "candidate_successes": passed, "baseline_failures": failed, "baseline_dns_failures": dnsFailed, "rounds": 3, "system_unchanged": true, "automatic_eligible": status == "ok" && dnsFailed == 3 && method == "udp"}}
+	m := Measurement{Kind: "solution_trial", Target: t.URL, Status: status, Started: time.Now().UTC(), Data: map[string]any{"candidate": "dns", "resolver_ip": r.IP, "resolver": r.Name, "dns_method": method, "candidate_successes": passed, "baseline_failures": failed, "baseline_dns_failures": dnsFailed, "rounds": 3, "system_unchanged": true, "tcp_fallback": tcpFallback, "automatic_eligible": status == "ok" && dnsFailed == 3 && method == "udp" && !tcpFallback}}
 	return append(values, m)
 }
 

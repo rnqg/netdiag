@@ -101,3 +101,22 @@ func TestGatewayDoesNotSubstituteForTargetQuality(t *testing.T) {
 		t.Fatal("gateway replies substituted for target RTT")
 	}
 }
+
+func TestFlushVerificationUsesOriginalDNSFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "check.json")
+	report := diag.Report{Schema: diag.Schema, Targets: []diag.Target{{URL: "https://example.org/"}}, Measurements: []diag.Measurement{
+		{Kind: "http_baseline", Target: "https://example.net/", Status: "failed", Reason: "dns_timeout"},
+	}}
+	if err := WriteReport(path, report); err != nil {
+		t.Fatal(err)
+	}
+	target, err := flushVerificationTarget(path, nil)
+	if err != nil || target != "https://example.net/" {
+		t.Fatalf("wrong verification target: %q %v", target, err)
+	}
+	var out bytes.Buffer
+	before, after := report.Measurements[0], diag.Measurement{Status: "failed", Reason: "dns_not_found"}
+	if code := printFlushVerification(&out, target, before, after); code != 1 || !strings.Contains(out.String(), after.Reason) {
+		t.Fatalf("failed post-check was hidden: %d %s", code, &out)
+	}
+}

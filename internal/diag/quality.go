@@ -37,6 +37,7 @@ func QualityUDP(ctx context.Context, c *node.Client, duration time.Duration, siz
 		return m
 	}
 	defer conn.Close()
+	observeRoute(ctx, conn.RemoteAddr())
 	if err := setDontFragment(conn); err == nil {
 		m.Data["fragmentation"] = "request_only"
 		m.Data["request_fragmentation"] = "disabled"

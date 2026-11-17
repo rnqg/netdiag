@@ -72,6 +72,9 @@ func Candidate(r diag.Report) (Plan, error) {
 		}
 		ip, _ := m.Data["resolver_ip"].(string)
 		method, _ := m.Data["dns_method"].(string)
+		if m.Data["tcp_fallback"] == true {
+			method = "tcp"
+		}
 		for _, known := range diag.Resolvers {
 			if known.IP != ip {
 				continue
@@ -98,7 +101,7 @@ func PlanFromReport(r diag.Report) (Plan, error) {
 		return Plan{}, errors.New("обнаружен VPN или прокси; используйте инструкцию, чтобы не перезаписать настройки клиента")
 	}
 	for _, m := range r.Measurements {
-		if m.Kind == "solution_trial" && m.Status == "ok" && m.Data["automatic_eligible"] == true && m.Data["dns_method"] == "udp" {
+		if m.Kind == "solution_trial" && m.Status == "ok" && m.Data["automatic_eligible"] == true && m.Data["dns_method"] == "udp" && m.Data["tcp_fallback"] != true {
 			ip, _ := m.Data["resolver_ip"].(string)
 			known := false
 			for _, v := range diag.Resolvers {
@@ -213,6 +216,9 @@ func Launch(ctx context.Context, p Plan) error {
 		os.RemoveAll(dir)
 	}
 	if readErr == nil && result.Finished && result.Failure != "" {
+		if !result.Prepared {
+			return errors.New(result.Failure)
+		}
 		return fmt.Errorf("%s; состояние восстановления: %s", result.Failure, path)
 	}
 	if err != nil && readErr == nil && !result.Prepared {
@@ -255,7 +261,11 @@ func ApplyWorker(ctx context.Context, path, nonce string) error {
 		if err != nil {
 			r.Failure = "не удалось очистить кэш DNS"
 		} else {
-			fmt.Fprintln(os.Stdout, "Кэш DNS очищен. Повторите исходную проверку, чтобы проверить результат.")
+			if r.Plan.Target == "" {
+				fmt.Fprintln(os.Stdout, "Кэш DNS очищен. Повторите исходную проверку.")
+			} else {
+				fmt.Fprintln(os.Stdout, "Кэш DNS очищен.")
+			}
 		}
 		return err
 	}
@@ -286,8 +296,8 @@ func ApplyWorker(ctx context.Context, path, nonce string) error {
 		if base.Reason != "dns_not_found" && base.Reason != "dns_timeout" && base.Reason != "dns_error" {
 			return errors.New("повторная проверка не подтверждает исходную ошибку DNS")
 		}
-		_, ips := diag.QueryDNS(fresh, host, resolver, "udp", dns.TypeA)
-		if len(ips) == 0 {
+		query, ips := diag.QueryDNS(fresh, host, resolver, "udp", dns.TypeA)
+		if len(ips) == 0 || query.Data["tcp_fallback"] == true {
 			return errors.New("предлагаемый DNS больше не отвечает")
 		}
 		alt := diag.Probe(fresh, target, diag.ProbeConfig{Addresses: ips})
@@ -381,6 +391,10 @@ func ApplyWorker(ctx context.Context, path, nonce string) error {
 
 func Guard(ctx context.Context, path, nonce string) error {
 	ignoreInterrupts()
+	return guard(ctx, path, nonce, SystemAdapter{})
+}
+
+func guard(ctx context.Context, path, nonce string, adapter Adapter) error {
 	for ctx.Err() == nil {
 		r, err := load(path, nonce)
 		if errors.Is(err, os.ErrNotExist) {
@@ -401,7 +415,7 @@ func Guard(ctx context.Context, path, nonce string) error {
 		}
 		if r.Prepared && time.Now().After(r.Deadline) {
 			restoreCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			err := Restore(restoreCtx, SystemAdapter{}, r.Before, r.Written)
+			err := Restore(restoreCtx, adapter, r.Before, r.Written)
 			cancel()
 			r.Finished = true
 			r.Restored = err == nil

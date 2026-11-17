@@ -200,7 +200,9 @@ func toFloat(v any) float64 {
 
 func comparisonKey(m diag.Measurement) string {
 	identity := []any{m.Kind, m.Target}
-	for _, key := range []string{"family", "requested_protocol", "requested_tls", "resolver", "method", "qtype", "resolver_family", "negative_control", "phase", "packet_bytes", "round"} {
+	attempt := max(1, toFloat(m.Data["attempt"]))
+	identity = append(identity, attempt)
+	for _, key := range []string{"family", "requested_protocol", "requested_tls", "resolver", "method", "qtype", "resolver_family", "negative_control", "solution_trial", "phase", "packet_bytes", "round"} {
 		identity = append(identity, m.Data[key])
 	}
 	b, _ := json.Marshal(identity)
@@ -209,7 +211,7 @@ func comparisonKey(m diag.Measurement) string {
 
 func comparisonValues(m diag.Measurement) map[string]any {
 	values := map[string]any{"duration_ms": m.DurationMS}
-	for _, key := range []string{"dns_ms", "connect_ms", "tls_ms", "first_byte_ms", "protocol", "tls_version", "http_status", "final_http_status", "mbps", "download_mbps", "upload_mbps", "idle_p95_ms", "loaded_p95_ms", "p95_increase_ms", "rssi_dbm", "tx_mbps", "rx_mbps", "channel"} {
+	for _, key := range []string{"dns_ms", "connect_ms", "tls_ms", "first_byte_ms", "protocol", "tls_version", "http_status", "final_http_status", "mbps", "download_mbps", "upload_mbps", "idle_p95_ms", "loaded_p95_ms", "p95_increase_ms", "rssi_dbm", "tx_mbps", "rx_mbps", "channel", "failure_stage", "body_sample_bytes", "tcp_kernel_after_body"} {
 		if value, ok := m.Data[key]; ok {
 			values[key] = value
 		}
@@ -238,7 +240,7 @@ func Compare(before diag.Report, after *diag.Report) {
 	}
 	used := map[string]int{}
 	for _, old := range before.Measurements {
-		if !accepted[old.Kind] {
+		if !accepted[old.Kind] || before.Full && !after.Full && (strings.HasPrefix(old.ID, "quality/") || strings.HasPrefix(old.ID, "speed/")) {
 			continue
 		}
 		key := comparisonKey(old)

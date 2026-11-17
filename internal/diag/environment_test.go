@@ -1,7 +1,9 @@
 package diag
 
 import (
+	"context"
 	"encoding/json"
+	"net/netip"
 	"os"
 	"strings"
 	"testing"
@@ -51,5 +53,24 @@ func TestRouteParsingDoesNotConfuseInterfaceAndGateway(t *testing.T) {
 	iface, gateway := routeFields([]byte("route to: default\n gateway: 192.168.1.1\n interface: en0\n"))
 	if iface != "en0" || gateway != "192.168.1.1" {
 		t.Fatal(iface, gateway)
+	}
+}
+
+func TestTargetRouteChangeUsesSamePeer(t *testing.T) {
+	previous := netip.MustParseAddr("192.0.2.1")
+	other := netip.MustParseAddr("192.0.2.2")
+	routes := map[netip.Addr]string{previous: "eth0", other: "eth1"}
+	monitor := routeMonitor{peers: map[netip.Addr]string{}, lookup: func(_ context.Context, ip netip.Addr) string { return routes[ip] }}
+	ctx := context.Background()
+	monitor.observe(ctx, previous)
+	monitor.observe(ctx, other)
+	delete(routes, other)
+	if monitor.changed(ctx) {
+		t.Fatal("unavailable lookup reported as a route change")
+	}
+	routes[previous] = "tun0"
+	monitor.observe(ctx, previous)
+	if !monitor.changed(ctx) {
+		t.Fatal("route change for an existing target was missed")
 	}
 }

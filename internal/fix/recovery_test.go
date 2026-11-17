@@ -1,6 +1,8 @@
 package fix
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"os"
 	"os/exec"
@@ -135,5 +137,43 @@ func TestSnapshotReplacementKeepsPrivatePermissions(t *testing.T) {
 	result, err := load(path, r.Nonce)
 	if err != nil || !result.Finished {
 		t.Fatal(result, err)
+	}
+}
+
+func TestExpiredRepairGuardRestoresOrPreservesSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		external, failing bool
+	}{
+		{name: "restored"}, {name: "external change", external: true}, {name: "write failure", failing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(t.TempDir(), "net-repair-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "state.json")
+			before, written := fixtureStates()
+			current := written
+			if tc.external {
+				current = State{Interface: written.Interface, DNS: []string{"192.0.2.9"}}
+			}
+			adapter := &fakeAdapter{state: current, fail: tc.failing}
+			r := Record{Format: "netdiag-recovery-v1", Nonce: "guard", Prepared: true, Before: before, Written: written, Deadline: time.Now().Add(-time.Second)}
+			if err := save(path, r); err != nil {
+				t.Fatal(err)
+			}
+			err = guard(context.Background(), path, r.Nonce, adapter)
+			if !tc.external && !tc.failing {
+				if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) || err != nil || !Same(adapter.state, before) {
+					t.Fatalf("restoration did not close the session: %v %v %+v", err, statErr, adapter.state)
+				}
+			} else {
+				result, loadErr := load(path, r.Nonce)
+				if err == nil || loadErr != nil || !result.Finished || result.Failure == "" || !Same(adapter.state, current) {
+					t.Fatalf("unsafe rollback was not recoverable: %v %v %+v", err, loadErr, result)
+				}
+			}
+		})
 	}
 }

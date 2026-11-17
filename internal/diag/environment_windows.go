@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/netip"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"unsafe"
 
@@ -122,4 +124,21 @@ func inspectWindows(ctx context.Context, e *Environment) {
 		e.ProxyHint = e.ProxyHint || enabled == 1 || pac != ""
 		e.ProxyStateKnown = true
 	}
+}
+
+func routeSignature(ctx context.Context, ip netip.Addr) string {
+	if ctx.Err() != nil {
+		return ""
+	}
+	var address windows.Sockaddr
+	if ip.Is4() {
+		address = &windows.SockaddrInet4{Addr: ip.As4()}
+	} else {
+		address = &windows.SockaddrInet6{Addr: ip.As16()}
+	}
+	var index uint32
+	if windows.GetBestInterfaceEx(address, &index) != nil || index == 0 {
+		return ""
+	}
+	return strconv.FormatUint(uint64(index), 10)
 }
