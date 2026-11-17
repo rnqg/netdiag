@@ -90,3 +90,16 @@ func TestUDPLateRepliesAreVisibleWithoutSuccessfulRTT(t *testing.T) {
 		t.Fatalf("%+v %+v", m, m.Stats)
 	}
 }
+
+func TestICMPLoopbackKeepsFullReplyWindow(t *testing.T) {
+	for _, duration := range []time.Duration{20 * time.Millisecond, 2 * time.Second} {
+		m := QualityICMP(context.Background(), "127.0.0.1", duration)
+		if m.Status == "unavailable" && m.Reason == "icmp_socket_permission_or_platform" {
+			t.Skip(m.Reason)
+		}
+		count := int((duration + time.Second - 1) / time.Second)
+		if m.Stats == nil || m.Stats.Sent > count || m.Stats.Received == 0 || m.Stats.Lost != 0 {
+			t.Fatalf("unexpected loopback probes for %s: %+v", duration, m)
+		}
+	}
+}

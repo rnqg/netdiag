@@ -123,7 +123,7 @@ func QualityUDP(ctx context.Context, c *node.Client, duration time.Duration, siz
 	defer cancel()
 	var seq uint64
 sendLoop:
-	for sendCtx.Err() == nil {
+	for sendCtx.Err() == nil && time.Now().Before(requestedEnd) {
 		select {
 		case <-receiveFailed:
 			break sendLoop
@@ -223,18 +223,24 @@ func QualityICMP(ctx context.Context, host string, duration time.Duration) Measu
 		return m
 	}
 	m.Data["target_ip"] = ips[0].String()
-	start := time.Now()
-	run, cancel := context.WithTimeout(ctx, duration)
-	defer cancel()
 	conn, err := icmp.ListenPacket("udp4", "0.0.0.0")
 	if err != nil {
 		return qualityICMPFallback(ctx, ips[0], duration, m)
 	}
 	defer conn.Close()
+	stopRead := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stopRead()
 	nonce := make([]byte, 16)
 	rand.Read(nonce)
+	start := time.Now()
+	end := start.Add(duration)
+	run, cancel := context.WithDeadline(ctx, end)
+	defer cancel()
 	for seq := 0; run.Err() == nil; seq++ {
 		at := time.Now()
+		if !at.Before(end) {
+			break
+		}
 		sample := Sample{Sequence: seq, At: at.UTC(), Error: "response_timeout"}
 		msg := icmp.Message{Type: ipv4.ICMPTypeEcho, Body: &icmp.Echo{ID: 1731, Seq: seq % 65536, Data: nonce}}
 		wire, _ := msg.Marshal(nil)
@@ -242,11 +248,11 @@ func QualityICMP(ctx context.Context, host string, duration time.Duration) Measu
 		_, err = conn.WriteTo(wire, &net.UDPAddr{IP: ips[0]})
 		if err == nil {
 			deadline := at.Add(900 * time.Millisecond)
-			if d, ok := run.Deadline(); ok && d.Before(deadline) {
+			if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 				deadline = d
 			}
 			conn.SetReadDeadline(deadline)
-			for run.Err() == nil {
+			for ctx.Err() == nil {
 				buffer := make([]byte, 1500)
 				n, peer, e := conn.ReadFrom(buffer)
 				if e != nil {
@@ -272,6 +278,9 @@ func QualityICMP(ctx context.Context, host string, duration time.Duration) Measu
 			sample.Error = ErrorCode(err)
 			sample.SendError = true
 		}
+		if ctx.Err() != nil && !sample.OK {
+			break
+		}
 		m.Samples = append(m.Samples, sample)
 		wait := time.Until(at.Add(time.Second))
 		if wait > 0 {
@@ -292,6 +301,7 @@ func QualityICMP(ctx context.Context, host string, duration time.Duration) Measu
 	}
 	if ctx.Err() != nil {
 		m.Status = "partial"
+		m.Reason = "canceled_or_deadline"
 	}
 	m.DurationMS = float64(time.Since(start).Microseconds()) / 1000
 	return m
