@@ -279,9 +279,14 @@ func Probe(ctx context.Context, target Target, cfg ProbeConfig) Measurement {
 			mu.Lock()
 			data["redirect_followed"] = true
 			data["redirect_status"] = child.Status
-			data["final_http_status"] = child.Data["http_status"]
-			if v, ok := child.Data["final_http_status"]; ok {
-				data["final_http_status"] = v
+			for _, key := range []string{"http_status", "body_sample_bytes", "tcp_kernel_after_body", "tcp_kernel_body_offset_bytes", "peer_ip"} {
+				source := key
+				if child.Data["redirect_followed"] == true {
+					source = "final_" + key
+				}
+				if value, ok := child.Data[source]; ok {
+					data["final_"+key] = value
+				}
 			}
 			if v, ok := child.Data["failure_stage"]; ok {
 				data["failure_stage"] = v

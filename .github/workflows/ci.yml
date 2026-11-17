@@ -105,7 +105,12 @@ jobs:
           phases = [row for row in rows if row["kind"] == "bufferbloat"]
           assert {row["data"]["phase"] for row in phases} == {"download", "upload", "both"}, phases
           assert any(row["kind"] == "throughput" and row["status"] == "limited" for row in rows)
-          assert len({row["id"] for row in rows}) == len(rows)
+          ids = {row["id"] for row in rows}
+          assert len(ids) == len(rows)
+          for row in phases:
+              for key, value in row["data"].items():
+                  if key.endswith("_measurement_id"):
+                      assert value in ids, row
           PYVERIFY
       - name: Clean temporary workspace
         if: always()

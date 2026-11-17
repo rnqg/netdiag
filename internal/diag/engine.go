@@ -91,19 +91,11 @@ func RunFull(ctx context.Context, opts Options) Report {
 			opts.Progress("Качество подключения и размеры пакетов")
 		}
 		quality := RunQuality(ctx, qualityOptions)
-		appendSection := func(section Report) {
-			for _, m := range section.Measurements {
-				m.ID = section.Command + "/" + m.ID
-				r.Measurements = append(r.Measurements, m)
-			}
-			r.NetworkChanged = r.NetworkChanged || section.NetworkChanged || !SameNetwork(r.Environment, section.Environment)
-			r.Partial = r.Partial || section.Partial
-		}
-		appendSection(quality)
+		appendFullSection(&r, quality)
 		if !r.NetworkChanged && ctx.Err() == nil {
 			speedOptions := opts
 			speedOptions.MaxBytes -= qualityOptions.MaxBytes
-			appendSection(RunNodeSpeed(ctx, speedOptions))
+			appendFullSection(&r, RunNodeSpeed(ctx, speedOptions))
 		}
 	}
 	complete := 0
@@ -115,6 +107,28 @@ func RunFull(ctx context.Context, opts Options) Report {
 	r.Partial = r.Partial || complete < 3
 	r.Finish(ctx.Err())
 	return r
+}
+
+func appendFullSection(r *Report, section Report) {
+	prefix := section.Command + "/"
+	for _, m := range section.Measurements {
+		m.ID = prefix + m.ID
+		for _, key := range []string{"idle_measurement_id", "loaded_measurement_id", "load_measurement_id", "recovery_measurement_id"} {
+			if id, ok := m.Data[key].(string); ok && id != "" {
+				m.Data[key] = prefix + id
+			}
+		}
+		if ids, ok := m.Data["evidence_measurements"].([]string); ok {
+			updated := make([]string, len(ids))
+			for i, id := range ids {
+				updated[i] = prefix + id
+			}
+			m.Data["evidence_measurements"] = updated
+		}
+		r.Measurements = append(r.Measurements, m)
+	}
+	r.NetworkChanged = r.NetworkChanged || section.NetworkChanged || !SameNetwork(r.Environment, section.Environment)
+	r.Partial = r.Partial || section.Partial
 }
 
 func checkTarget(ctx context.Context, target Target, profile string) []Measurement {

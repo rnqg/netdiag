@@ -131,3 +131,17 @@ func TestPacketSizeRequiresRepeatedFailuresAndIgnoresLocalSendErrors(t *testing.
 		t.Fatal("local send errors misclassified", m)
 	}
 }
+
+func TestFullReportRetainsLinksBetweenMeasurements(t *testing.T) {
+	section := Report{Command: "speed", Measurements: []Measurement{
+		{ID: "source", Kind: "udp_rtt"},
+		{ID: "assessment", Kind: "bufferbloat", Data: map[string]any{"idle_measurement_id": "source", "evidence_measurements": []string{"source"}}},
+	}}
+	var result Report
+	appendFullSection(&result, section)
+	source := result.Measurements[0].ID
+	report := result.Measurements[1]
+	if report.Data["idle_measurement_id"] != source || report.Data["evidence_measurements"].([]string)[0] != source {
+		t.Fatalf("invalid evidence references: %+v", report)
+	}
+}

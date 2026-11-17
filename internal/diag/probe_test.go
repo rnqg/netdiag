@@ -120,14 +120,20 @@ func TestAltSvcPortParsing(t *testing.T) {
 func TestRedirectPropagatesRestrictedFinalResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
-			http.Redirect(w, r, "/denied", 302)
+			http.Redirect(w, r, "/second-hop", 302)
+			return
+		}
+		if r.URL.Path == "/second-hop" {
+			w.Header().Set("Location", "/denied")
+			w.WriteHeader(302)
 			return
 		}
 		w.WriteHeader(403)
+		io.WriteString(w, "denied")
 	}))
 	defer server.Close()
 	m := Probe(context.Background(), Target{URL: server.URL + "/"}, ProbeConfig{})
-	if m.Status != "restricted" || m.Reason != "http_403" || m.Data["final_http_status"] != 403 {
+	if m.Status != "restricted" || m.Reason != "http_403" || m.Data["final_http_status"] != 403 || m.Data["final_body_sample_bytes"] != int64(6) || m.Data["final_tcp_kernel_after_body"] == nil {
 		t.Fatalf("%+v", m)
 	}
 }
