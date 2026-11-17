@@ -55,26 +55,12 @@ func QueryDNS(ctx context.Context, host string, r Resolver, method string, qtype
 	var reply *dns.Msg
 	var err error
 	if method == "doh" {
-		payload, _ := msg.Pack()
-		tr := &http.Transport{Proxy: nil, DialContext: func(c context.Context, _ string, _ string) (net.Conn, error) {
-			return (&net.Dialer{Timeout: 2 * time.Second}).DialContext(c, "tcp", net.JoinHostPort(r.IP, "443"))
-		}, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}, TLSHandshakeTimeout: 2 * time.Second, MaxResponseHeaderBytes: 16384}
+		tr := newDoHTransport(r.IP)
 		defer tr.CloseIdleConnections()
-		req, _ := http.NewRequestWithContext(ctx, "POST", r.DoH, bytes.NewReader(payload))
-		req.Header.Set("Content-Type", "application/dns-message")
-		req.Header.Set("Accept", "application/dns-message")
-		var resp *http.Response
-		resp, err = (&http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Do(req)
-		if err == nil {
-			defer resp.Body.Close()
-			var data []byte
-			data, err = io.ReadAll(io.LimitReader(resp.Body, 65537))
-			if err == nil && resp.StatusCode == 200 && len(data) <= 65536 {
-				reply = new(dns.Msg)
-				err = reply.Unpack(data)
-			} else if err == nil {
-				err = io.ErrUnexpectedEOF
-			}
+		var protocol string
+		reply, protocol, err = exchangeDoH(ctx, msg, r.DoH, tr)
+		if protocol != "" {
+			m.Data["http_protocol"] = protocol
 		}
 	} else {
 		network := method
@@ -124,4 +110,46 @@ func QueryDNS(ctx context.Context, host string, r Resolver, method string, qtype
 	m.Data["addresses"] = values
 	m.DurationMS = float64(time.Since(start).Microseconds()) / 1000
 	return m, ips
+}
+
+func newDoHTransport(ip string) *http.Transport {
+	return &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, _ string, _ string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
+		},
+		TLSClientConfig:        &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSHandshakeTimeout:    2 * time.Second,
+		MaxResponseHeaderBytes: 16384,
+		ForceAttemptHTTP2:      true,
+	}
+}
+
+func exchangeDoH(ctx context.Context, msg *dns.Msg, endpoint string, tr *http.Transport) (*dns.Msg, string, error) {
+	payload, err := msg.Pack()
+	if err != nil {
+		return nil, "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+	client := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
+	if err != nil {
+		return nil, resp.Proto, err
+	}
+	if resp.StatusCode != http.StatusOK || len(data) > 65536 {
+		return nil, resp.Proto, io.ErrUnexpectedEOF
+	}
+	reply := new(dns.Msg)
+	err = reply.Unpack(data)
+	return reply, resp.Proto, err
 }
