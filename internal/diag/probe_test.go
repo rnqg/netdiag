@@ -113,3 +113,18 @@ func TestAltSvcPortParsing(t *testing.T) {
 		}
 	}
 }
+
+func TestRedirectPropagatesRestrictedFinalResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/denied", 302)
+			return
+		}
+		w.WriteHeader(403)
+	}))
+	defer server.Close()
+	m := Probe(context.Background(), Target{URL: server.URL + "/"}, ProbeConfig{})
+	if m.Status != "restricted" || m.Reason != "http_403" || m.Data["final_http_status"] != 403 {
+		t.Fatalf("%+v", m)
+	}
+}

@@ -49,3 +49,5 @@ func detach(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.DETACHED_PROCESS}
 }
 func ignoreInterrupts() {}
+
+func preserveOwner(_ *os.File, _ string) error { return nil }

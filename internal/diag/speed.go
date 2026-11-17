@@ -7,6 +7,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
+
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,9 +50,10 @@ func (b *Budget) Refund(n int) {
 }
 
 type budgetReader struct {
-	ctx    context.Context
-	budget *Budget
-	used   *atomic.Int64
+	ctx      context.Context
+	budget   *Budget
+	used     *atomic.Int64
+	progress func(int)
 }
 
 func (r *budgetReader) Read(p []byte) (int, error) {
@@ -63,11 +66,49 @@ func (r *budgetReader) Read(p []byte) (int, error) {
 	}
 	clear(p[:n])
 	r.used.Add(int64(n))
+	if r.progress != nil {
+		r.progress(n)
+	}
 	return n, nil
+}
+
+type transferActivity struct {
+	mu          sync.Mutex
+	first, last time.Time
+	events      int
+}
+
+func (a *transferActivity) record(n int) {
+	if n <= 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now()
+	if a.first.IsZero() {
+		a.first = now
+	}
+	a.last = now
+	a.events++
+}
+
+func (a *transferActivity) sustained(start time.Time, duration time.Duration) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	gap := min(2*time.Second, duration/3)
+	return a.events >= 2 && !a.first.After(start.Add(duration/5)) && !a.last.Before(start.Add(duration-gap))
 }
 
 func NodeLoad(ctx context.Context, c *node.Client, phase string, streams int, duration time.Duration, budget *Budget, rate int64) Measurement {
 	m := Measurement{Kind: "throughput", Target: c.Base, Status: "ok", Started: time.Now().UTC(), Data: map[string]any{"phase": phase, "streams": streams, "rate_limit_bytes_sec": rate}}
+	if budget.Left.Load() <= 0 {
+		m.Status = "limited"
+		m.Reason = "traffic_budget"
+		m.Data["full_interval"] = false
+		m.Data["download_bytes"] = int64(0)
+		m.Data["upload_bytes"] = int64(0)
+		return m
+	}
 	run, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
 	start := time.Now()
@@ -76,6 +117,8 @@ func NodeLoad(ctx context.Context, c *node.Client, phase string, streams int, du
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	failures := []string{}
+	streamResults := []map[string]any{}
+	sustained := 0
 	var rateMu sync.Mutex
 	var next time.Time
 	throttle := func(n int) {
@@ -99,6 +142,51 @@ func NodeLoad(ctx context.Context, c *node.Client, phase string, streams int, du
 	}
 	transfer := func(direction string) {
 		defer wg.Done()
+		activity := &transferActivity{}
+		var supplied atomic.Int64
+		var connection net.Conn
+		var connectionMu sync.Mutex
+		var tcpBefore map[string]any
+		var tcpLast map[string]any
+		var tcpSampled time.Time
+		observe := func(n int) {
+			activity.record(n)
+			if n <= 0 {
+				return
+			}
+			connectionMu.Lock()
+			if connection != nil && time.Since(tcpSampled) >= time.Second {
+				tcpLast = TCPStats(connection)
+				tcpSampled = time.Now()
+			}
+			connectionMu.Unlock()
+		}
+		traced := func(ctx context.Context) context.Context {
+			return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+				connectionMu.Lock()
+				connection = info.Conn
+				tcpBefore = TCPStats(info.Conn)
+				connectionMu.Unlock()
+			}})
+		}
+		defer func() {
+			full := activity.sustained(start, duration)
+			connectionMu.Lock()
+			tcpAfter := tcpLast
+			if connection != nil {
+				if current := TCPStats(connection); current["status"] == "ok" {
+					tcpAfter = current
+				}
+			}
+			result := map[string]any{"direction": direction, "sustained": full, "tcp_kernel_before": tcpBefore, "tcp_kernel_after": tcpAfter, "tcp_kernel_last_progress_sample_at": tcpSampled}
+			connectionMu.Unlock()
+			mu.Lock()
+			streamResults = append(streamResults, result)
+			if full {
+				sustained++
+			}
+			mu.Unlock()
+		}()
 		streamClient := c.StreamClient()
 		defer func() {
 			if tr, ok := streamClient.HTTP.Transport.(interface{ CloseIdleConnections() }); ok {
@@ -108,7 +196,7 @@ func NodeLoad(ctx context.Context, c *node.Client, phase string, streams int, du
 		var err error
 		if direction == "download" {
 			var resp *http.Response
-			resp, err = streamClient.Request(run, "GET", "/v1/"+c.Session.ID+"/download", nil)
+			resp, err = streamClient.Request(traced(run), "GET", "/v1/"+c.Session.ID+"/download", nil)
 			if err == nil {
 				defer resp.Body.Close()
 				buffer := make([]byte, 32768)
@@ -120,6 +208,7 @@ func NodeLoad(ctx context.Context, c *node.Client, phase string, streams int, du
 					read, e := resp.Body.Read(buffer[:n])
 					budget.Refund(n - read)
 					downloaded.Add(int64(read))
+					observe(read)
 					throttle(read)
 					if e != nil {
 						if e != io.EOF {
@@ -130,7 +219,7 @@ func NodeLoad(ctx context.Context, c *node.Client, phase string, streams int, du
 				}
 			}
 		} else {
-			reader := &budgetReader{ctx: run, budget: budget, used: &uploaded}
+			reader := &budgetReader{ctx: run, budget: budget, used: &supplied, progress: func(n int) { uploaded.Add(int64(n)); observe(n) }}
 			var resp *http.Response
 			body := io.Reader(reader)
 			if rate > 0 {
@@ -138,12 +227,12 @@ func NodeLoad(ctx context.Context, c *node.Client, phase string, streams int, du
 			}
 			requestCtx, stopRequest := context.WithDeadline(ctx, start.Add(duration+time.Second))
 			defer stopRequest()
-			resp, err = streamClient.Request(requestCtx, "POST", "/v1/"+c.Session.ID+"/upload", body)
+			resp, err = streamClient.Request(traced(requestCtx), "POST", "/v1/"+c.Session.ID+"/upload", body)
 			if err == nil {
 				defer resp.Body.Close()
 				var result map[string]int64
 				if json.NewDecoder(io.LimitReader(resp.Body, 1024)).Decode(&result) == nil {
-					if n, ok := result["received_bytes"]; ok && n >= 0 {
+					if n, ok := result["received_bytes"]; ok && n > 0 && n <= supplied.Load() {
 						acknowledged.Add(n)
 						confirmedUploads.Add(1)
 					}
@@ -184,7 +273,14 @@ func NodeLoad(ctx context.Context, c *node.Client, phase string, streams int, du
 	m.Data["confirmed_upload_streams"] = confirmedUploads.Load()
 	m.Data["budget_exhausted"] = budget.Left.Load() <= 0
 	m.Data["upload_counter_scope"] = "bytes supplied to HTTP transport; acknowledgement by the peer is not guaranteed"
-	m.Data["full_interval"] = elapsed >= duration.Seconds()*0.9
+	expectedStreams := streams
+	if phase == "both" {
+		expectedStreams *= 2
+	}
+	m.Data["stream_results"] = streamResults
+	m.Data["sustained_streams"] = sustained
+	m.Data["full_interval"] = elapsed >= duration.Seconds() && sustained == expectedStreams
+	m.Data["tcp_kernel_scope"] = "socket peer; a transparent proxy may terminate TCP locally"
 	if budget.Left.Load() <= 0 {
 		m.Status = "limited"
 		m.Reason = "traffic_budget"
@@ -192,9 +288,13 @@ func NodeLoad(ctx context.Context, c *node.Client, phase string, streams int, du
 		m.Status = "failed"
 		m.Reason = "load_failed"
 	}
-	if m.Status == "ok" && elapsed < duration.Seconds()*0.9 {
+	if m.Status == "ok" && elapsed < duration.Seconds() {
 		m.Status = "limited"
 		m.Reason = "transfer_ended_early"
+	}
+	if m.Status == "ok" && sustained != expectedStreams {
+		m.Status = "partial"
+		m.Reason = "load_not_sustained"
 	}
 	if m.Status == "ok" && phase != "download" && confirmedUploads.Load() != int64(streams) {
 		m.Status = "partial"
@@ -222,14 +322,14 @@ func RunNodeSpeed(ctx context.Context, opts Options) Report {
 		r.Finish(nil)
 		return r
 	}
-	controlBudget := min(opts.MaxBytes/8, int64(1<<20))
-	if err = c.Open(ctx, opts.MaxBytes-controlBudget, 300); err != nil {
+	controlBudget := min(opts.MaxBytes/8, int64(2<<20))
+	if err = c.Open(ctx, opts.MaxBytes-controlBudget, 600); err != nil {
 		r.Measurements = append(r.Measurements, Measurement{Kind: "node", Status: "unavailable", Reason: err.Error()})
-		r.Finish(nil)
+		r.Finish(ctx.Err())
 		return r
 	}
 	defer c.Close()
-	control, err := c.NewSession(ctx, controlBudget, 300)
+	control, err := c.NewSession(ctx, controlBudget, 600)
 	if err != nil {
 		r.Measurements = append(r.Measurements, Measurement{Kind: "node", Status: "unavailable", Reason: "control_session_unavailable"})
 		r.Finish(ctx.Err())
@@ -237,81 +337,84 @@ func RunNodeSpeed(ctx context.Context, opts Options) Report {
 	}
 	defer control.Close()
 	budget := NewBudget(c.Session.MaxBytes)
+	total := c.Session.MaxBytes
+	weight := 10
+	singles := map[string]Measurement{}
 	for _, phase := range []string{"download", "upload"} {
-		if ctx.Err() != nil || budget.Left.Load() <= 0 {
+		if ctx.Err() != nil {
 			break
 		}
 		if opts.Progress != nil {
 			opts.Progress("Один TCP-поток: " + phase)
 		}
-		m := NodeLoad(ctx, c, phase, 1, 10*time.Second, budget, 0)
+		limit := budget.Left.Load() / int64(weight)
+		weight--
+		m := loadWithinBudget(ctx, c, phase, 1, 10*time.Second, budget, limit, 0)
 		m.ID = "single-" + phase
+		singles[phase] = m
 		r.Measurements = append(r.Measurements, m)
 	}
-	if budget.Left.Load() <= 0 {
-		r.Measurements = append(r.Measurements, Measurement{Kind: "bufferbloat", Status: "unavailable", Reason: "traffic_budget"})
-		r.Finish(ctx.Err())
-		return r
+	r.Measurements = append(r.Measurements, speedBudgetAssessment(singles, total))
+	type trialCandidate struct {
+		phase string
+		rate  int64
 	}
-	recovery := QualityUDP(ctx, control, 10*time.Second, 128)
-	recovery.ID = "recovery-single"
-	r.Measurements = append(r.Measurements, recovery)
-	if opts.Progress != nil {
-		opts.Progress("RTT без нагрузки")
-	}
-	baseline := QualityUDP(ctx, control, 20*time.Second, 128)
-	baseline.ID = "idle"
-	r.Measurements = append(r.Measurements, baseline)
+	var candidates []trialCandidate
 	for _, phase := range []string{"download", "upload", "both"} {
-		if ctx.Err() != nil || budget.Left.Load() <= 0 {
-			break
+		units := 2
+		if phase == "both" {
+			units = 4
 		}
+		if ctx.Err() != nil || budget.Left.Load() <= 0 {
+			r.Measurements = append(r.Measurements, Measurement{ID: "bufferbloat-" + phase, Kind: "bufferbloat", Target: c.Base, Status: "unavailable", Reason: "traffic_budget_or_cancellation", Data: map[string]any{"phase": phase}})
+			weight -= units
+			continue
+		}
+		if opts.Progress != nil {
+			opts.Progress("RTT без нагрузки: " + phase)
+		}
+		baseline := QualityUDP(ctx, control, 20*time.Second, 128)
+		baseline.ID = "idle-" + phase
+		limit := budget.Left.Load() * int64(units) / int64(weight)
+		weight -= units
 		if opts.Progress != nil {
 			opts.Progress("Нагрузка: " + phase)
 		}
-		var load Measurement
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() { defer wg.Done(); load = NodeLoad(ctx, c, phase, 2, 20*time.Second, budget, 0) }()
-		latency := QualityUDP(ctx, control, 20*time.Second, 128)
-		wg.Wait()
+		load, latency, gateway := pairedLoad(ctx, c, control, phase, 20*time.Second, budget, limit, 0, LocalGateway(r.Environment))
+		gateway.ID = "gateway-load-" + phase
 		load.ID = "load-" + phase
 		latency.ID = "rtt-" + phase
-		r.Measurements = append(r.Measurements, load, latency)
-		comparison := LoadedLatency(baseline, latency, load, phase)
-		r.Measurements = append(r.Measurements, comparison)
-		if opts.Progress != nil {
-			opts.Progress("Восстановление")
-		}
 		recovery := QualityUDP(ctx, control, 10*time.Second, 128)
 		recovery.ID = "recovery-" + phase
-		r.Measurements = append(r.Measurements, recovery)
-		if comparison.Status == "ok" && number(comparison.Data["p95_increase_ms"]) >= 20 && budget.Left.Load() > 1<<20 && ctx.Err() == nil {
-			bytes := number(load.Data["download_bytes"]) + number(load.Data["upload_bytes"])
-			rate := int64(bytes / 20 * 0.7)
+		comparison := LoadedLatency(baseline, latency, load, phase)
+		AssessRecovery(&comparison, baseline, recovery)
+		r.Measurements = append(r.Measurements, baseline, load, latency, gateway, recovery, comparison)
+		if comparison.Status == "ok" && number(comparison.Data["p95_increase_ms"]) >= 20 {
+			rate := int64((number(load.Data["download_mbps"]) + number(load.Data["upload_mbps"])) * 1e6 / 8 * 0.7)
 			if rate > 0 {
-				if opts.Progress != nil {
-					opts.Progress("Проверка ограничения нагрузки: " + phase)
-				}
-				var reduced Measurement
-				wg.Add(1)
-				go func() { defer wg.Done(); reduced = NodeLoad(ctx, c, phase, 2, 10*time.Second, budget, rate) }()
-				delay := QualityUDP(ctx, control, 10*time.Second, 128)
-				wg.Wait()
-				reduced.ID = "limited-load-" + phase
-				delay.ID = "limited-rtt-" + phase
-				r.Measurements = append(r.Measurements, reduced, delay)
-				limitedStats := SteadyStats(delay, 3*time.Second)
-				unlimitedStats := SteadyStats(latency, 5*time.Second)
-				if limitedStats.Received >= 30 {
-					trial := Measurement{ID: "rate-trial-" + phase, Kind: "rate_limit_trial", Target: c.Base, Status: "inconclusive", Data: map[string]any{"phase": phase, "rate_bytes_sec": rate, "unlimited_p95_ms": unlimitedStats.P95, "limited_p95_ms": limitedStats.P95, "limited_loss_percent": limitedStats.LossPercent, "unlimited_loss_percent": unlimitedStats.LossPercent, "warmup_ms": 3000, "system_unchanged": true}}
-					if reduced.Status == "ok" && delay.Status == "ok" && limitedStats.P95 < unlimitedStats.P95*0.8 && limitedStats.LossPercent <= unlimitedStats.LossPercent {
-						trial.Status = "ok"
-					}
-					r.Measurements = append(r.Measurements, trial)
-				}
+				candidates = append(candidates, trialCandidate{phase, rate})
 			}
 		}
+	}
+	remainingWeight := 0
+	for _, candidate := range candidates {
+		if candidate.phase == "both" {
+			remainingWeight += 2
+		} else {
+			remainingWeight++
+		}
+	}
+	for _, candidate := range candidates {
+		units := 1
+		if candidate.phase == "both" {
+			units = 2
+		}
+		limit := budget.Left.Load() * int64(units) / int64(remainingWeight)
+		remainingWeight -= units
+		if opts.Progress != nil {
+			opts.Progress("Проверка ограничения нагрузки: " + candidate.phase)
+		}
+		r.Measurements = append(r.Measurements, runRateTrial(ctx, c, control, candidate.phase, candidate.rate, budget, limit, LocalGateway(r.Environment))...)
 	}
 	r.Finish(ctx.Err())
 	return r
@@ -403,23 +506,13 @@ func RunMLab(ctx context.Context, opts Options) Report {
 			ch, err = client.StartUpload(run)
 		}
 		m := Measurement{ID: "ndt7-" + phase, Kind: "ndt7", Status: "failed", Started: start.UTC(), Data: map[string]any{"phase": phase, "single_stream": true, "provider": "M-Lab", "public_measurement": true}}
-		var bytes, elapsed int64
+
 		if err == nil {
-			for event := range ch {
-				if event.Origin == spec.OriginClient && event.AppInfo != nil {
-					bytes = event.AppInfo.NumBytes
-					elapsed = event.AppInfo.ElapsedTime
-				}
-			}
+			populateNDT(&m, phase, ch)
 		} else {
 			m.Reason = "ndt7_start_failed"
 		}
-		if elapsed > 0 && bytes > 0 {
-			m.Status = "ok"
-			m.Data["mbps"] = float64(bytes) * 8 / float64(elapsed)
-			m.Data["bytes"] = bytes
-			m.Data["elapsed_us"] = elapsed
-		}
+
 		if budget.Left.Load() <= 0 {
 			m.Status = "limited"
 			m.Reason = "traffic_budget"
@@ -438,29 +531,18 @@ func RunMLab(ctx context.Context, opts Options) Report {
 
 func RunQuality(ctx context.Context, opts Options) Report {
 	r := NewReport("quality", opts)
+	var c *node.Client
 	if opts.Node != "" {
-		c, err := node.NewClient(opts.Node, opts.NodeToken)
+		var err error
+		c, err = node.NewClient(opts.Node, opts.NodeToken)
 		if err == nil {
-			err = c.Open(ctx, opts.MaxBytes, int(opts.Duration.Seconds())+60)
+			err = c.Open(ctx, opts.MaxBytes, int(opts.Duration.Seconds())+120)
 		}
 		if err != nil {
 			r.Measurements = append(r.Measurements, Measurement{Kind: "udp_rtt", Status: "unavailable", Reason: err.Error()})
+			c = nil
 		} else {
 			defer c.Close()
-			m := QualityUDP(ctx, c, opts.Duration, 128)
-			m.ID = "quality-udp"
-			r.Measurements = append(r.Measurements, m)
-			for _, size := range []int{512, 1024, 1200, 1232, 1252, 1272, 1360, 1400, 1440, 1452, 1472} {
-				if ctx.Err() != nil {
-					break
-				}
-				p := QualityUDP(ctx, c, 1500*time.Millisecond, size)
-				p.ID = fmt.Sprintf("packet-size-%d", size)
-				p.Kind = "packet_size"
-				p.Data["interpretation"] = "Проверка размера UDP payload; нижняя граница размера без фрагментации применима только если fragmentation=disabled. Тайм-аут не определяет точный PMTU."
-				r.Measurements = append(r.Measurements, p)
-			}
-			r.Measurements = append(r.Measurements, PacketSizeAssessment(r.Measurements, c.Base))
 		}
 	}
 	host := "ya.ru"
@@ -469,15 +551,51 @@ func RunQuality(ctx context.Context, opts Options) Report {
 			host = u
 		}
 	}
-	m := QualityICMP(ctx, host, opts.Duration)
-	m.ID = "quality-icmp"
-	r.Measurements = append(r.Measurements, m)
-	if r.Environment.Gateway != "" && ctx.Err() == nil {
-		g := QualityICMP(ctx, r.Environment.Gateway, min(opts.Duration, 10*time.Second))
-		g.ID = "gateway-icmp"
-		g.Target = "local-gateway"
-		delete(g.Data, "target_ip")
-		r.Measurements = append(r.Measurements, g)
+	var icmp, udp, gateway Measurement
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); icmp = QualityICMP(ctx, host, opts.Duration); icmp.ID = "quality-icmp" }()
+	if address := LocalGateway(r.Environment); address != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			gateway = QualityICMP(ctx, address, opts.Duration)
+			gateway.ID = "gateway-icmp"
+			gateway.Target = "local-gateway"
+			delete(gateway.Data, "target_ip")
+		}()
+	}
+	if c != nil {
+		wg.Add(1)
+		go func() { defer wg.Done(); udp = QualityUDP(ctx, c, opts.Duration, 128); udp.ID = "quality-udp" }()
+	}
+	wg.Wait()
+	r.Measurements = append(r.Measurements, icmp)
+	if gateway.ID != "" {
+		r.Measurements = append(r.Measurements, gateway)
+	}
+	if c != nil {
+		r.Measurements = append(r.Measurements, udp)
+		sizes := []int{512, 1472, 1024, 1452, 1200, 1440, 1232, 1400, 1252, 1360, 1272}
+		for round := 0; round < 3 && ctx.Err() == nil; round++ {
+			for index := range sizes {
+				if ctx.Err() != nil {
+					break
+				}
+				at := index
+				if round%2 == 1 {
+					at = len(sizes) - 1 - index
+				}
+				size := sizes[at]
+				p := QualityUDP(ctx, c, 1100*time.Millisecond, size)
+				p.ID = fmt.Sprintf("packet-size-%d-round-%d", size, round+1)
+				p.Kind = "packet_size"
+				p.Data["round"] = round + 1
+				p.Data["interpretation"] = "UDP payload с чередованием размеров; точный PMTU не определяется тайм-аутом"
+				r.Measurements = append(r.Measurements, p)
+			}
+		}
+		r.Measurements = append(r.Measurements, PacketSizeAssessment(r.Measurements, c.Base))
 	}
 	r.Finish(ctx.Err())
 	return r

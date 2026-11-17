@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,5 +60,33 @@ func TestBudgetRefundAndNoOverrun(t *testing.T) {
 	b.Refund(20)
 	if b.Used.Load() != 80 || b.Take(30) != 20 {
 		t.Fatal("incorrect refund")
+	}
+}
+
+func TestUDPLateRepliesAreVisibleWithoutSuccessfulRTT(t *testing.T) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workers sync.WaitGroup
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b := make([]byte, 2048)
+		for {
+			n, addr, e := conn.ReadFromUDP(b)
+			if e != nil {
+				return
+			}
+			packet := append([]byte(nil), b[:n]...)
+			workers.Add(1)
+			go func() { defer workers.Done(); time.Sleep(800 * time.Millisecond); conn.WriteToUDP(packet, addr) }()
+		}
+	}()
+	defer func() { conn.Close(); <-done; workers.Wait() }()
+	c := &node.Client{Base: "https://fixture.invalid", Peer: "127.0.0.1", Session: node.Session{ID: "00112233445566778899aabbccddeeff", Key: hex.EncodeToString(make([]byte, 32)), UDPPort: conn.LocalAddr().(*net.UDPAddr).Port}}
+	m := QualityUDP(context.Background(), c, 200*time.Millisecond, 128)
+	if m.Stats == nil || m.Stats.Received != 0 || m.Stats.LateReplies == 0 {
+		t.Fatalf("%+v %+v", m, m.Stats)
 	}
 }

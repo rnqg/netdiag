@@ -46,6 +46,9 @@ func Instructions(p Plan) string {
 	if p.Action == "flush" {
 		return "Очистите кэш DNS средствами вашей ОС, затем повторите исходную проверку. Очистка кэша не меняет конфигурацию подключения."
 	}
+	if p.Method == "tcp" {
+		return "В испытаниях сработал DNS по TCP: " + p.Resolver + ". Используйте приложение или локальный резолвер с принудительным DNS-over-TCP. Простая смена IP системного DNS не воспроизводит этот вариант."
+	}
 	if p.Method == "doh" || p.Method == "dot" {
 		address := p.Resolver
 		for _, resolver := range diag.Resolvers {
@@ -95,7 +98,7 @@ func PlanFromReport(r diag.Report) (Plan, error) {
 		return Plan{}, errors.New("обнаружен VPN или прокси; используйте инструкцию, чтобы не перезаписать настройки клиента")
 	}
 	for _, m := range r.Measurements {
-		if m.Kind == "solution_trial" && m.Status == "ok" && m.Data["automatic_eligible"] == true {
+		if m.Kind == "solution_trial" && m.Status == "ok" && m.Data["automatic_eligible"] == true && m.Data["dns_method"] == "udp" {
 			ip, _ := m.Data["resolver_ip"].(string)
 			known := false
 			for _, v := range diag.Resolvers {
@@ -125,7 +128,10 @@ func save(path string, r Record) error {
 	}
 	name := f.Name()
 	defer os.Remove(name)
-	if err = f.Chmod(0600); err == nil {
+	if err = preserveOwner(f, path); err == nil {
+		err = f.Chmod(0600)
+	}
+	if err == nil {
 		_, err = f.Write(b)
 	}
 	if err == nil {
@@ -157,7 +163,12 @@ func load(path, nonce string) (Record, error) {
 	if dirErr != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
 		return r, errors.New("invalid recovery directory")
 	}
-	b, err := os.ReadFile(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return r, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, 32769))
 	if err != nil {
 		return r, err
 	}
@@ -237,7 +248,9 @@ func ApplyWorker(ctx context.Context, path, nonce string) error {
 		save(path, r)
 	}()
 	if r.Plan.Action == "flush" {
-		err = Flush(ctx)
+		flushCtx, stop := context.WithTimeout(ctx, 15*time.Second)
+		defer stop()
+		err = Flush(flushCtx)
 		r.Finished = true
 		if err != nil {
 			r.Failure = "не удалось очистить кэш DNS"
@@ -360,7 +373,10 @@ func ApplyWorker(ctx context.Context, path, nonce string) error {
 	if err != nil && r.Restored {
 		fmt.Fprintln(os.Stdout, "Исправление не прошло проверку; исходные настройки восстановлены.")
 	}
-	return save(path, r)
+	if saveErr := save(path, r); saveErr != nil {
+		return saveErr
+	}
+	return err
 }
 
 func Guard(ctx context.Context, path, nonce string) error {

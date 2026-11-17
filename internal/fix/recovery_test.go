@@ -1,8 +1,12 @@
 package fix
 
 import (
+	"flag"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -58,5 +62,78 @@ func TestRecoveryRejectsInvalidNonceAndRetainsFailedRollback(t *testing.T) {
 	}
 	if _, err = os.Stat(path); err != nil {
 		t.Fatal(err)
+	}
+}
+
+var ownershipHelperPath = flag.String("snapshot-helper", "", "")
+
+func TestRecoveryOwnershipHelper(t *testing.T) {
+	if *ownershipHelperPath == "" {
+		return
+	}
+	r, err := load(*ownershipHelperPath, "owner-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Finished = true
+	if err = save(*ownershipHelperPath, r); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestElevatedSnapshotRemainsReadableByCaller(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Getenv("NETDIAG_TEST_ELEVATION") != "1" {
+		t.Skip("optional Unix elevation test")
+	}
+	if out, err := exec.Command("sudo", "-n", "true").CombinedOutput(); err != nil {
+		if os.Getenv("GITHUB_ACTIONS") == "true" {
+			t.Fatalf("CI must exercise snapshot ownership with sudo: %v %s", err, out)
+		}
+		t.Skip("passwordless sudo unavailable: " + strings.TrimSpace(string(out)))
+	}
+	dir, err := os.MkdirTemp(t.TempDir(), "net-repair-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "state.json")
+	r := Record{Format: "netdiag-recovery-v1", Nonce: "owner-test", OwnerPID: os.Getpid()}
+	if err = save(path, r); err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sudo", "-n", "--", exe, "-test.run=^TestRecoveryOwnershipHelper$", "-snapshot-helper="+path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("elevated helper: %v %s", err, out)
+	}
+	result, err := load(path, "owner-test")
+	if err != nil || !result.Finished {
+		t.Fatalf("caller cannot read completed snapshot: %+v %v", result, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("snapshot permissions: %v %v", info, err)
+	}
+}
+
+func TestSnapshotReplacementKeepsPrivatePermissions(t *testing.T) {
+	dir, err := os.MkdirTemp(t.TempDir(), "net-repair-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "state.json")
+	r := Record{Format: "netdiag-recovery-v1", Nonce: "replace"}
+	if err = save(path, r); err != nil {
+		t.Fatal(err)
+	}
+	r.Finished = true
+	if err = save(path, r); err != nil {
+		t.Fatal(err)
+	}
+	result, err := load(path, r.Nonce)
+	if err != nil || !result.Finished {
+		t.Fatal(result, err)
 	}
 }

@@ -62,3 +62,72 @@ func TestPacketSizeDoesNotInventExactPMTU(t *testing.T) {
 		t.Fatal("quota-limited measurement used as MTU evidence")
 	}
 }
+
+func stableLatency(rtt float64) Measurement {
+	start := time.Now().UTC()
+	m := Measurement{Kind: "udp_rtt", Target: "fixture", Status: "ok", Started: start}
+	for i := 0; i < 200; i++ {
+		m.Samples = append(m.Samples, Sample{Sequence: i, At: start.Add(time.Duration(i) * 100 * time.Millisecond), OK: true, RTT: rtt})
+	}
+	return m
+}
+
+func TestRecoveryPreventsAttributingPersistentDelayToLoad(t *testing.T) {
+	idle := stableLatency(10)
+	loaded := stableLatency(100)
+	load := Measurement{Status: "ok", Data: map[string]any{"full_interval": true}}
+	m := LoadedLatency(idle, loaded, load, "download")
+	AssessRecovery(&m, idle, stableLatency(90))
+	if m.Status != "inconclusive" || m.Reason != "latency_did_not_recover" {
+		t.Fatal(m)
+	}
+	m = LoadedLatency(idle, loaded, load, "download")
+	AssessRecovery(&m, idle, stableLatency(12))
+	if m.Status != "ok" {
+		t.Fatal(m)
+	}
+}
+
+func TestRateTrialRequiresBothUnlimitedControls(t *testing.T) {
+	idle := stableLatency(10)
+	loads := []Measurement{{Status: "ok", Data: map[string]any{"full_interval": true}}, {Status: "ok", Data: map[string]any{"full_interval": true}}, {Status: "ok", Data: map[string]any{"full_interval": true}}}
+	delays := []Measurement{stableLatency(100), stableLatency(50), stableLatency(110)}
+	recoveries := []Measurement{stableLatency(10), stableLatency(10), stableLatency(10)}
+	m := RateTrialAssessment("download", idle, loads, delays, recoveries, 1000)
+	if m.Status != "ok" {
+		t.Fatal(m)
+	}
+	delays[2] = stableLatency(40)
+	m = RateTrialAssessment("download", idle, loads, delays, recoveries, 1000)
+	if m.Status == "ok" {
+		t.Fatal("natural improvement accepted as a workaround", m)
+	}
+}
+
+func TestNetworkMonitorTracksDNSAndProxyChanges(t *testing.T) {
+	a := Environment{DNSFingerprint: "a", ProxyStateKnown: true}
+	b := Environment{DNSFingerprint: "b", ProxyStateKnown: true}
+	if SameNetwork(a, b) {
+		t.Fatal("DNS change ignored")
+	}
+	b.DNSFingerprint = "a"
+	b.ProxyHint = true
+	if SameNetwork(a, b) {
+		t.Fatal("proxy change ignored")
+	}
+}
+
+func TestPacketSizeRequiresRepeatedFailuresAndIgnoresLocalSendErrors(t *testing.T) {
+	good := Measurement{Kind: "packet_size", Status: "ok", Data: map[string]any{"packet_bytes": 1200, "fragmentation": "disabled"}, Stats: &Statistics{Sent: 11, Received: 11}}
+	bad := Measurement{Kind: "packet_size", Status: "failed", Data: map[string]any{"packet_bytes": 1400, "fragmentation": "disabled"}, Stats: &Statistics{Sent: 11, Lost: 11}}
+	if m := PacketSizeAssessment([]Measurement{good, bad}, "fixture"); m.Data["large_packets_failed"] == true {
+		t.Fatal("single failed interval accepted", m)
+	}
+	if m := PacketSizeAssessment([]Measurement{good, bad, bad}, "fixture"); m.Data["large_packets_failed"] != true {
+		t.Fatal(m)
+	}
+	bad.Stats = &Statistics{Sent: 0, LocalErrors: 11}
+	if m := PacketSizeAssessment([]Measurement{good, bad, bad}, "fixture"); m.Data["large_packets_failed"] == true {
+		t.Fatal("local send errors misclassified", m)
+	}
+}

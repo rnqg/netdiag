@@ -16,6 +16,15 @@ import (
 )
 
 func SystemCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if strings.EqualFold(name, "powershell.exe") {
+		args = append([]string(nil), args...)
+		for i := 0; i+1 < len(args); i++ {
+			if strings.EqualFold(args[i], "-Command") {
+				args[i+1] = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); " + args[i+1]
+				break
+			}
+		}
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
 	cmd.WaitDelay = time.Second
@@ -53,6 +62,9 @@ func Inspect() Environment {
 				fingerprint = append(fingerprint, iface.Name+":"+addr.String())
 			}
 		}
+		if item.Up && !item.Loopback && item.IPv4 && !item.VPNHint {
+			fingerprint = append(fingerprint, iface.Name+":"+iface.HardwareAddr.String())
+		}
 		if item.Up && !item.Loopback {
 			e.VPNHint = e.VPNHint || item.VPNHint
 		}
@@ -63,7 +75,11 @@ func Inspect() Environment {
 			e.ProxyHint = true
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	timeout := 2 * time.Second
+	if runtime.GOOS == "windows" {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	switch runtime.GOOS {
 	case "darwin":
@@ -83,6 +99,7 @@ func Inspect() Environment {
 		}
 		if b, err := SystemCommand(ctx, "scutil", "--proxy"); err == nil {
 			s := string(b)
+			e.ProxyStateKnown = true
 			e.ProxyHint = e.ProxyHint || strings.Contains(s, "HTTPEnable : 1") || strings.Contains(s, "HTTPSEnable : 1") || strings.Contains(s, "SOCKSEnable : 1") || strings.Contains(s, "ProxyAutoConfigEnable : 1")
 		}
 	case "linux":
@@ -99,18 +116,31 @@ func Inspect() Environment {
 			}
 		}
 	case "windows":
-		b, err := SystemCommand(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$r=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1; if($r){[pscustomobject]@{Gateway=$r.NextHop;Interface=$r.InterfaceAlias;Proxy=(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings' -ErrorAction SilentlyContinue).ProxyEnable}|ConvertTo-Json -Compress}")
+		script := `$ErrorActionPreference='Stop'; $metrics=@{}; Get-NetIPInterface -AddressFamily IPv4 | ForEach-Object {$metrics[[int]$_.InterfaceIndex]=[int]$_.InterfaceMetric}; $routes=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Sort-Object @{Expression={[int]$_.RouteMetric+$metrics[[int]$_.InterfaceIndex]}}); $r=$routes | Select-Object -First 1; $ids=@(Get-NetAdapter -Physical | ForEach-Object {$_.ifIndex}); $physical=$routes | Where-Object {$ids -contains $_.InterfaceIndex} | Select-Object -First 1; $proxy=Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue; $dns=@(Get-DnsClientServerAddress | Sort-Object InterfaceIndex,AddressFamily | Select-Object InterfaceIndex,AddressFamily,ServerAddresses); [pscustomobject]@{Gateway=$r.NextHop;Interface=$r.InterfaceAlias;PhysicalGateway=$physical.NextHop;PhysicalInterface=$physical.InterfaceAlias;Proxy=[int](($proxy.ProxyEnable -eq 1) -or [bool]$proxy.AutoConfigURL);DNS=$dns} | ConvertTo-Json -Depth 5 -Compress`
+		b, err := SystemCommand(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
 		if err == nil {
 			var v struct {
-				Gateway, Interface string
-				Proxy              int
+				Gateway, Interface, PhysicalGateway, PhysicalInterface string
+				Proxy                                                  int
+				DNS                                                    json.RawMessage
 			}
 			if json.Unmarshal(b, &v) == nil {
 				e.Gateway = v.Gateway
 				e.ActiveInterface = v.Interface
+				e.PhysicalGateway = v.PhysicalGateway
+				e.PhysicalInterface = v.PhysicalInterface
 				e.ProxyHint = e.ProxyHint || v.Proxy == 1
+				e.ProxyStateKnown = true
+				if len(v.DNS) > 0 {
+					hash := sha256.Sum256(v.DNS)
+					e.DNSFingerprint = hex.EncodeToString(hash[:])
+				}
 			}
 		}
+	}
+	discoverPhysical(ctx, &e)
+	if e.DNSFingerprint == "" {
+		e.DNSFingerprint = dnsFingerprint(ctx)
 	}
 	e.RouteAvailable = e.ActiveInterface != ""
 	if !e.RouteAvailable {
@@ -119,7 +149,7 @@ func Inspect() Environment {
 	sort.Strings(fingerprint)
 	linkSum := sha256.Sum256([]byte(strings.Join(fingerprint, "|")))
 	e.LinkFingerprint = hex.EncodeToString(linkSum[:])
-	fingerprint = append(fingerprint, e.ActiveInterface, e.Gateway, fmt.Sprint(e.ProxyHint))
+	fingerprint = append(fingerprint, e.ActiveInterface, e.Gateway, fmt.Sprint(e.ProxyHint), e.DNSFingerprint)
 	sort.Strings(fingerprint)
 	sum := sha256.Sum256([]byte(strings.Join(fingerprint, "|")))
 	e.Fingerprint = hex.EncodeToString(sum[:])
@@ -129,6 +159,12 @@ func Inspect() Environment {
 }
 
 func SameNetwork(a, b Environment) bool {
+	if a.DNSFingerprint != "" && b.DNSFingerprint != "" && a.DNSFingerprint != b.DNSFingerprint {
+		return false
+	}
+	if a.ProxyStateKnown && b.ProxyStateKnown && a.ProxyHint != b.ProxyHint {
+		return false
+	}
 	if a.LinkFingerprint != "" && b.LinkFingerprint != "" && a.LinkFingerprint != b.LinkFingerprint {
 		return false
 	}

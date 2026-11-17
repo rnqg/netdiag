@@ -27,12 +27,19 @@ jobs:
           if command -v cygpath >/dev/null 2>&1; then
             task_temp=$(cygpath -m "$task_temp")
           fi
+          mkdir -p "$task_temp/temp"
+          echo "GOTMPDIR=$task_temp/temp" >> "$GITHUB_ENV"
+          echo "TMPDIR=$task_temp/temp" >> "$GITHUB_ENV"
+          echo "TMP=$task_temp/temp" >> "$GITHUB_ENV"
+          echo "TEMP=$task_temp/temp" >> "$GITHUB_ENV"
           echo "TASK_TEMP=$task_temp" >> "$GITHUB_ENV"
           echo "GOCACHE=$task_temp/cache" >> "$GITHUB_ENV"
           echo "GOMODCACHE=$task_temp/modules" >> "$GITHUB_ENV"
           echo "GOPATH=$task_temp/path" >> "$GITHUB_ENV"
           echo "TEST_TELEMETRY_DIR=$task_temp/telemetry" >> "$GITHUB_ENV"
       - run: go test -race -timeout 3m ./...
+        env:
+          NETDIAG_TEST_ELEVATION: "1"
       - run: go vet ./...
       - name: Build both architectures
         run: |

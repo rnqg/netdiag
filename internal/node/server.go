@@ -59,6 +59,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/v1/session" && r.Method == "POST" {
+		controller := http.NewResponseController(w)
+		controller.SetReadDeadline(time.Now().Add(5 * time.Second))
 		var spec SessionRequest
 		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&spec) != nil || spec.MaxBytes <= 0 || spec.Seconds <= 0 {
 			http.Error(w, "invalid request", 400)
@@ -167,6 +169,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			read, err := r.Body.Read(buffer[:n])
+			s.mu.Lock()
+			st.Used -= int64(n - read)
+			s.mu.Unlock()
 			total += int64(read)
 			if err != nil {
 				if err != io.EOF {

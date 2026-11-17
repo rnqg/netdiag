@@ -58,3 +58,25 @@ func TestTargetNormalizationRemovesSecrets(t *testing.T) {
 		}
 	}
 }
+
+func TestIPv6TargetAndPortValidation(t *testing.T) {
+	for _, raw := range []string{"https://[2001:db8::1]:8443/", "http://[::1]/"} {
+		v, err := NormalizeTarget(raw)
+		if err != nil || v.URL != raw {
+			t.Fatalf("%s: %+v %v", raw, v, err)
+		}
+	}
+	for _, raw := range []string{"https://example.org:0/", "https://example.org:65536/"} {
+		if _, err := NormalizeTarget(raw); err == nil {
+			t.Fatal("invalid port accepted", raw)
+		}
+	}
+}
+
+func TestSendFailuresAreNotNetworkLoss(t *testing.T) {
+	late := 900.0
+	s := Summarize([]Sample{{Sequence: 0, SendError: true}, {Sequence: 1, OK: true, RTT: 10}, {Sequence: 2, Late: true, LateRTT: &late}})
+	if s.Attempts != 3 || s.Sent != 2 || s.LocalErrors != 1 || s.Lost != 1 || s.LateReplies != 1 || s.LossPercent != 50 {
+		t.Fatal(s)
+	}
+}

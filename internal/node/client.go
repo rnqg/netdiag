@@ -70,7 +70,7 @@ func (c *Client) Request(ctx context.Context, method, path string, body io.Reade
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
-	req.Header.Set("User-Agent", "netdiag/0.1.1")
+	req.Header.Set("User-Agent", "netdiag/0.1.2")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

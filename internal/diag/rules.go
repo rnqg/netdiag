@@ -1,13 +1,33 @@
 package diag
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 func Analyze(r Report) []Finding {
 	f := []Finding{}
+	if r.Command == "quality" {
+		received := 0
+		var evidence []string
+		for _, m := range r.Measurements {
+			if m.Kind == "udp_rtt" || m.Kind == "icmp_rtt" {
+				evidence = append(evidence, m.ID)
+				if m.Stats != nil {
+					received += m.Stats.Received
+				}
+			}
+		}
+		if received == 0 {
+			f = append(f, Finding{Code: "quality_not_measured", Severity: "error", Confidence: "observed", Summary: "Качество соединения не измерено", Evidence: evidence, Next: "Нет успешных RTT-проб. Проверьте доступность измерительного узла и причины отказов; это не доказывает отсутствие интернета."})
+		}
+	}
+	dnsFailures := map[string][]string{}
+
 	if r.Command == "speed" {
 		missingLoad := false
 		for _, m := range r.Measurements {
-			if m.Kind == "bufferbloat" && m.Status == "unavailable" {
+			if m.Kind == "bufferbloat" && m.Status != "ok" {
 				missingLoad = true
 			}
 		}
@@ -16,7 +36,7 @@ func Analyze(r Report) []Finding {
 		}
 		measured := false
 		for _, m := range r.Measurements {
-			if (m.Kind == "throughput" || m.Kind == "ndt7") && (m.Status == "ok" || m.Status == "limited") {
+			if (m.Kind == "throughput" || m.Kind == "ndt7") && (m.Status == "ok" || m.Status == "limited") && (number(m.Data["mbps"]) > 0 || number(m.Data["download_mbps"]) > 0 || number(m.Data["upload_mbps"]) > 0) {
 				measured = true
 			}
 		}
@@ -32,6 +52,13 @@ func Analyze(r Report) []Finding {
 	}
 	baselines, reachable := 0, 0
 	for _, m := range r.Measurements {
+		if m.Kind == "dns_alternative" && m.Status != "ok" && m.Reason != "dns_nodata" {
+			key := fmt.Sprintf("%v / %v", m.Data["resolver"], m.Data["method"])
+			if family, ok := m.Data["resolver_family"]; ok {
+				key += fmt.Sprint(" / ", family)
+			}
+			dnsFailures[key] = append(dnsFailures[key], m.ID)
+		}
 		if m.Kind == "path_mtu" && m.Status == "ok" && m.Data["large_packets_failed"] == true {
 			f = append(f, Finding{Code: "packet_size_difference", Severity: "warning", Confidence: "observed", Summary: "Результаты UDP-проб зависят от размера пакета", Evidence: []string{m.ID}, Next: "Повторите чередующиеся проверки малых и больших пакетов. Проверьте MTU туннеля и PMTU; точное значение MTU и причина отказа этим замером не установлены."})
 		}
@@ -83,6 +110,14 @@ func Analyze(r Report) []Finding {
 				f = append(f, Finding{Code: "wifi_signal", Severity: "warning", Confidence: "observed", Summary: "Во время замера сигнал Wi-Fi был слабым", Evidence: []string{m.ID}, Next: "Повторите проверку ближе к точке доступа или по кабелю. Одного значения сигнала недостаточно, чтобы объяснить все сетевые ошибки."})
 			}
 		}
+	}
+	keys := make([]string, 0, len(dnsFailures))
+	for key := range dnsFailures {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		f = append(f, Finding{Code: "dns_transport_failed", Severity: "info", Confidence: "observed", Summary: "Не все DNS-пробы успешны: " + key, Evidence: dnsFailures[key], Next: "Смотрите причины отдельных проб. Отказ этого DNS-транспорта не означает отказ системного DNS или всего подключения."})
 	}
 	if baselines > 0 && reachable == 0 {
 		f = append(f, Finding{Code: "all_targets_failed", Severity: "error", Confidence: "observed", Summary: "Ни одна выбранная веб-цель не ответила", Next: "Проверьте подключение и шлюз. Если другие приложения работают, сравните их прокси, DNS и маршрутизацию с утилитой."})

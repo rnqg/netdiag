@@ -6,10 +6,19 @@ import (
 )
 
 func Summarize(samples []Sample) Statistics {
-	s := Statistics{Sent: len(samples)}
+	s := Statistics{Attempts: len(samples)}
 	values := make([]float64, 0, len(samples))
 	burst := 0
 	for i, p := range samples {
+		if p.SendError {
+			s.LocalErrors++
+			burst = 0
+			continue
+		}
+		s.Sent++
+		if p.Late {
+			s.LateReplies++
+		}
 		if !p.OK {
 			s.Lost++
 			burst++

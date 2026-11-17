@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const Version = "0.1.1"
+const Version = "0.1.2"
 const Schema = 1
 
 type Target struct {
@@ -15,15 +15,21 @@ type Target struct {
 }
 
 type Sample struct {
-	Sequence int       `json:"sequence"`
-	At       time.Time `json:"at"`
-	RTT      float64   `json:"rtt_ms"`
-	OK       bool      `json:"ok"`
-	Error    string    `json:"error,omitempty"`
-	Size     int       `json:"size,omitempty"`
+	Sequence  int       `json:"sequence"`
+	At        time.Time `json:"at"`
+	RTT       float64   `json:"rtt_ms"`
+	OK        bool      `json:"ok"`
+	Error     string    `json:"error,omitempty"`
+	Size      int       `json:"size,omitempty"`
+	SendError bool      `json:"send_error,omitempty"`
+	Late      bool      `json:"late,omitempty"`
+	LateRTT   *float64  `json:"late_reply_rtt_ms,omitempty"`
 }
 
 type Statistics struct {
+	Attempts    int      `json:"attempts"`
+	LocalErrors int      `json:"local_send_errors"`
+	LateReplies int      `json:"late_replies"`
 	Sent        int      `json:"sent"`
 	Received    int      `json:"received"`
 	Lost        int      `json:"lost"`
@@ -109,18 +115,22 @@ type Interface struct {
 }
 
 type Environment struct {
-	OS              string            `json:"os"`
-	Arch            string            `json:"arch"`
-	Interfaces      []Interface       `json:"interfaces"`
-	VPNHint         bool              `json:"vpn_hint"`
-	ProxyHint       bool              `json:"proxy_hint"`
-	RouteAvailable  bool              `json:"route_available"`
-	RouteReason     string            `json:"route_reason,omitempty"`
-	ActiveInterface string            `json:"-"`
-	Gateway         string            `json:"-"`
-	Fingerprint     string            `json:"-"`
-	LinkFingerprint string            `json:"-"`
-	Capabilities    map[string]string `json:"capabilities"`
+	OS                string            `json:"os"`
+	Arch              string            `json:"arch"`
+	Interfaces        []Interface       `json:"interfaces"`
+	VPNHint           bool              `json:"vpn_hint"`
+	ProxyHint         bool              `json:"proxy_hint"`
+	RouteAvailable    bool              `json:"route_available"`
+	RouteReason       string            `json:"route_reason,omitempty"`
+	ActiveInterface   string            `json:"-"`
+	Gateway           string            `json:"-"`
+	PhysicalInterface string            `json:"-"`
+	PhysicalGateway   string            `json:"-"`
+	DNSFingerprint    string            `json:"-"`
+	ProxyStateKnown   bool              `json:"-"`
+	Fingerprint       string            `json:"-"`
+	LinkFingerprint   string            `json:"-"`
+	Capabilities      map[string]string `json:"capabilities"`
 }
 
 type Report struct {

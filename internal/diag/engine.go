@@ -22,7 +22,7 @@ func RunCheck(ctx context.Context, opts Options) Report {
 	run, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 	if opts.Profile == "deep" {
-		r.Measurements = append(r.Measurements, WiFi(run, r.Environment.ActiveInterface))
+		r.Measurements = append(r.Measurements, WiFi(run, r.Environment.PhysicalInterface))
 	}
 	var mu sync.Mutex
 	slots := make(chan struct{}, 6)
@@ -53,7 +53,7 @@ func RunCheck(ctx context.Context, opts Options) Report {
 	if opts.Profile == "deep" && run.Err() == nil && len(opts.Targets) > 0 {
 		u, _ := url.Parse(opts.Targets[0].URL)
 		if net.ParseIP(u.Hostname()) == nil {
-			r.Measurements = append(r.Measurements, dnsMatrix(run, u.Hostname())...)
+			r.Measurements = append(r.Measurements, dnsMatrix(run, u.Hostname(), hasGlobalIPv6(r.Environment))...)
 		}
 	}
 	sort.SliceStable(r.Measurements, func(i, j int) bool { return r.Measurements[i].ID < r.Measurements[j].ID })
@@ -70,8 +70,8 @@ func RunCheck(ctx context.Context, opts Options) Report {
 		m.ID = "short-icmp"
 		r.Measurements = append(r.Measurements, m)
 	}
-	if run.Err() == nil && r.Environment.Gateway != "" {
-		m := QualityICMP(run, r.Environment.Gateway, 3*time.Second)
+	if run.Err() == nil && LocalGateway(r.Environment) != "" {
+		m := QualityICMP(run, LocalGateway(r.Environment), 3*time.Second)
 		m.ID = "short-gateway-icmp"
 		m.Target = "local-gateway"
 		delete(m.Data, "target_ip")
@@ -170,7 +170,7 @@ func checkTarget(ctx context.Context, target Target, profile string) []Measureme
 	return result
 }
 
-func dnsMatrix(ctx context.Context, host string) []Measurement {
+func dnsMatrix(ctx context.Context, host string, ipv6 bool) []Measurement {
 	type task struct {
 		resolver Resolver
 		method   string
@@ -178,9 +178,18 @@ func dnsMatrix(ctx context.Context, host string) []Measurement {
 	}
 	tasks := []task{}
 	for _, resolver := range Resolvers {
-		for _, method := range []string{"udp", "tcp", "doh", "dot"} {
-			for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
-				tasks = append(tasks, task{resolver, method, qtype})
+		addresses := []Resolver{resolver}
+		if ipv6 && resolver.IPv6 != "" {
+			copy := resolver
+			copy.IP = resolver.IPv6
+			addresses = append(addresses, copy)
+		}
+		for _, resolver := range addresses {
+			for _, method := range []string{"udp", "tcp", "doh", "dot"} {
+				for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+					tasks = append(tasks, task{resolver, method, qtype})
+				}
+				tasks = append(tasks, task{resolver, method, 0})
 			}
 		}
 	}
@@ -198,7 +207,23 @@ func dnsMatrix(ctx context.Context, host string) []Measurement {
 				return
 			}
 			defer func() { <-slots }()
-			m, _ := QueryDNS(ctx, host, job.resolver, job.method, job.qtype)
+			queryHost := host
+			qtype := job.qtype
+			if qtype == 0 {
+				queryHost = "netdiag-negative.invalid"
+				qtype = dns.TypeA
+			}
+			m, _ := QueryDNS(ctx, queryHost, job.resolver, job.method, qtype)
+			if job.qtype == 0 {
+				m.Data["negative_control"] = true
+				if m.Reason == "dns_NXDOMAIN" {
+					m.Status = "ok"
+					m.Reason = ""
+				} else if m.Status == "ok" || m.Reason == "dns_nodata" {
+					m.Status = "failed"
+					m.Reason = "dns_negative_control_unexpected"
+				}
+			}
 			m.ID = fmt.Sprintf("dns-matrix-%02d", i)
 			results[i] = m
 		}(i, job)
@@ -277,7 +302,7 @@ func testDNSAlternative(ctx context.Context, t Target, r Resolver, method string
 	if passed == 3 && failed == 3 {
 		status = "ok"
 	}
-	m := Measurement{Kind: "solution_trial", Target: t.URL, Status: status, Started: time.Now().UTC(), Data: map[string]any{"candidate": "dns", "resolver_ip": r.IP, "resolver": r.Name, "dns_method": method, "candidate_successes": passed, "baseline_failures": failed, "baseline_dns_failures": dnsFailed, "rounds": 3, "system_unchanged": true, "automatic_eligible": status == "ok" && dnsFailed == 3 && (method == "udp" || method == "tcp")}}
+	m := Measurement{Kind: "solution_trial", Target: t.URL, Status: status, Started: time.Now().UTC(), Data: map[string]any{"candidate": "dns", "resolver_ip": r.IP, "resolver": r.Name, "dns_method": method, "candidate_successes": passed, "baseline_failures": failed, "baseline_dns_failures": dnsFailed, "rounds": 3, "system_unchanged": true, "automatic_eligible": status == "ok" && dnsFailed == 3 && method == "udp"}}
 	return append(values, m)
 }
 
@@ -300,4 +325,13 @@ func measurementIPs(m Measurement) []net.IP {
 		}
 	}
 	return result
+}
+
+func hasGlobalIPv6(e Environment) bool {
+	for _, iface := range e.Interfaces {
+		if iface.Up && !iface.Loopback && iface.IPv6 {
+			return true
+		}
+	}
+	return false
 }

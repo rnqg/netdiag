@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"golang.org/x/net/idna"
@@ -27,14 +28,21 @@ func NormalizeTarget(raw string) (Target, error) {
 	if u.Scheme != "https" && u.Scheme != "http" {
 		return Target{}, fmt.Errorf("поддерживаются только HTTP и HTTPS")
 	}
-	host, err := idna.Lookup.ToASCII(u.Hostname())
+	host := u.Hostname()
+	if net.ParseIP(host) == nil {
+		host, err = idna.Lookup.ToASCII(host)
+	}
 	if err != nil {
 		return Target{}, fmt.Errorf("некорректный домен")
 	}
 	if strings.ContainsAny(host, "\r\n\t ") {
 		return Target{}, fmt.Errorf("некорректный домен")
 	}
-	if u.Port() != "" {
+	if port := u.Port(); port != "" {
+		n, e := strconv.Atoi(port)
+		if e != nil || n < 1 || n > 65535 {
+			return Target{}, fmt.Errorf("порт должен быть от 1 до 65535")
+		}
 		host = net.JoinHostPort(host, u.Port())
 	} else if strings.Contains(host, ":") {
 		host = "[" + host + "]"

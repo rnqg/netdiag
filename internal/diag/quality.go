@@ -51,6 +51,10 @@ func QualityUDP(ctx context.Context, c *node.Client, duration time.Duration, siz
 	sent := map[uint64]time.Time{}
 	seen := map[uint64]bool{}
 	duplicates, reordered := 0, 0
+	missedIntervals := 0
+	var previousSend time.Time
+	var readFailure string
+	receiveFailed := make(chan struct{})
 	var highest uint64
 	readerCtx, stop := context.WithCancel(ctx)
 	defer stop()
@@ -64,6 +68,10 @@ func QualityUDP(ctx context.Context, c *node.Client, duration time.Duration, siz
 			if e != nil {
 				if t, ok := e.(net.Error); ok && t.Timeout() {
 					continue
+				}
+				if readerCtx.Err() == nil {
+					readFailure = ErrorCode(e)
+					close(receiveFailed)
 				}
 				return
 			}
@@ -83,6 +91,9 @@ func QualityUDP(ctx context.Context, c *node.Client, duration time.Duration, siz
 						samples[seq].OK = true
 						samples[seq].RTT = rtt
 						samples[seq].Error = ""
+					} else {
+						samples[seq].Late = true
+						samples[seq].LateRTT = &rtt
 					}
 					if seq < highest {
 						reordered++
@@ -110,7 +121,13 @@ func QualityUDP(ctx context.Context, c *node.Client, duration time.Duration, siz
 	sendCtx, cancel := context.WithDeadline(ctx, requestedEnd)
 	defer cancel()
 	var seq uint64
+sendLoop:
 	for sendCtx.Err() == nil {
+		select {
+		case <-receiveFailed:
+			break sendLoop
+		default:
+		}
 		if c.UDPUsed != nil {
 			used := c.UDPUsed.Add(int64(size * 2))
 			if used > c.Session.MaxBytes {
@@ -121,6 +138,10 @@ func QualityUDP(ctx context.Context, c *node.Client, duration time.Duration, siz
 			}
 		}
 		at := time.Now()
+		if !previousSend.IsZero() {
+			missedIntervals += max(0, int(at.Sub(previousSend)/(100*time.Millisecond))-1)
+		}
+		previousSend = at
 		packet, e := node.Packet(c.Session.ID, key, seq, size)
 		if e != nil {
 			m.Status = "unavailable"
@@ -136,11 +157,14 @@ func QualityUDP(ctx context.Context, c *node.Client, duration time.Duration, siz
 		if e != nil {
 			mu.Lock()
 			samples[seq].Error = ErrorCode(e)
+			samples[seq].SendError = true
 			mu.Unlock()
 		}
 		seq++
 		select {
 		case <-sendCtx.Done():
+		case <-receiveFailed:
+			break sendLoop
 		case <-ticker.C:
 		}
 	}
@@ -158,6 +182,16 @@ func QualityUDP(ctx context.Context, c *node.Client, duration time.Duration, siz
 	stats.Duplicates = duplicates
 	stats.Reordered = reordered
 	m.Stats = &stats
+	m.Data["missed_send_intervals"] = missedIntervals
+	if readFailure != "" {
+		m.Status = "partial"
+		m.Reason = "udp_receive_error"
+		m.Data["receive_error"] = readFailure
+	}
+	if stats.Sent == 0 && stats.LocalErrors > 0 && m.Status == "ok" {
+		m.Status = "unavailable"
+		m.Reason = "udp_send_errors"
+	}
 	if len(samples) == 0 && m.Status == "ok" {
 		m.Status = "unavailable"
 		m.Reason = "no_samples"
@@ -235,6 +269,7 @@ func QualityICMP(ctx context.Context, host string, duration time.Duration) Measu
 			}
 		} else {
 			sample.Error = ErrorCode(err)
+			sample.SendError = true
 		}
 		m.Samples = append(m.Samples, sample)
 		wait := time.Until(at.Add(time.Second))
@@ -247,7 +282,10 @@ func QualityICMP(ctx context.Context, host string, duration time.Duration) Measu
 	}
 	stats := Summarize(m.Samples)
 	m.Stats = &stats
-	if stats.Received == 0 {
+	if stats.Sent == 0 && stats.LocalErrors > 0 {
+		m.Status = "unavailable"
+		m.Reason = "icmp_send_errors"
+	} else if stats.Received == 0 {
 		m.Status = "failed"
 		m.Reason = "no_icmp_replies"
 	}

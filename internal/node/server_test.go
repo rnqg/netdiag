@@ -150,3 +150,39 @@ func TestClientRejectsRedirectWithoutLeakingToken(t *testing.T) {
 		t.Fatal("token leaked to redirect")
 	}
 }
+
+type shortBody struct{ left int }
+
+func (r *shortBody) Read(p []byte) (int, error) {
+	if r.left == 0 {
+		return 0, io.EOF
+	}
+	p[0] = 1
+	r.left--
+	return 1, nil
+}
+
+func TestUploadBudgetTracksActualBytes(t *testing.T) {
+	s := NewServer(testToken, 4444, 65536)
+	call := func(path string, body io.Reader) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", path, body)
+		r.RemoteAddr = "192.0.2.1:1234"
+		r.Header.Set("Authorization", "Bearer "+testToken)
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, r)
+		return w
+	}
+	w := call("/v1/session", strings.NewReader(`{"max_bytes":65536,"seconds":60}`))
+	var session Session
+	if err := json.Unmarshal(w.Body.Bytes(), &session); err != nil {
+		t.Fatal(err)
+	}
+	w = call("/v1/"+session.ID+"/upload", &shortBody{left: 100})
+	var result map[string]int64
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["received_bytes"] != 100 || s.sessions[session.ID].Used != 100 {
+		t.Fatalf("ack=%v used=%d", result, s.sessions[session.ID].Used)
+	}
+}

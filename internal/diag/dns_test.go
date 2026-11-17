@@ -142,3 +142,11 @@ func TestDoHNegotiatesHTTP2AndFallsBackToHTTP1(t *testing.T) {
 		})
 	}
 }
+
+func TestDNSFailureAppearsInFindings(t *testing.T) {
+	r := Report{Command: "check", Measurements: []Measurement{{ID: "dns-test", Kind: "dns_alternative", Status: "failed", Reason: "timeout", Data: map[string]any{"resolver": "fixture", "method": "udp"}}}}
+	findings := Analyze(r)
+	if len(findings) != 1 || findings[0].Code != "dns_transport_failed" || len(findings[0].Evidence) != 1 {
+		t.Fatal(findings)
+	}
+}

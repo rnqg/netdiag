@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -56,5 +58,86 @@ func TestNodeLoadCancellation(t *testing.T) {
 	m := NodeLoad(ctx, c, "both", 2, 10*time.Second, NewBudget(1<<20), 0)
 	if time.Since(start) > 2*time.Second || m.Status != "partial" {
 		t.Fatalf("cancellation: %+v", m)
+	}
+}
+
+type stalledTransport struct{}
+
+func (stalledTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: 200, Body: &stalledBody{ctx: r.Context()}, Header: make(http.Header)}, nil
+}
+
+type stalledBody struct {
+	ctx  context.Context
+	sent bool
+}
+
+func (b *stalledBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		p[0] = 1
+		b.sent = true
+		return 1, nil
+	}
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+func (b *stalledBody) Close() error { return nil }
+
+func TestStalledLoadIsNotACompleteInterval(t *testing.T) {
+	c := &node.Client{Base: "https://fixture.invalid", HTTP: &http.Client{Transport: stalledTransport{}}}
+	m := NodeLoad(context.Background(), c, "download", 1, 100*time.Millisecond, NewBudget(100000), 0)
+	if m.Status == "ok" || m.Data["full_interval"] == true || m.Data["download_bytes"] != int64(1) {
+		t.Fatalf("%+v", m)
+	}
+}
+
+func TestPhaseBudgetPreservesRemainingPhases(t *testing.T) {
+	c := loadFixture(t)
+	total := NewBudget(1 << 20)
+	m := loadWithinBudget(context.Background(), c, "download", 1, time.Second, total, 65536, 0)
+	if total.Used.Load() != 65536 || total.Left.Load() != (1<<20)-65536 || m.Status != "limited" {
+		t.Fatalf("%+v used=%d", m, total.Used.Load())
+	}
+}
+
+func TestBudgetEstimateWarnsAboutFastConnections(t *testing.T) {
+	values := map[string]Measurement{"download": {Data: map[string]any{"download_mbps": 500.0}}, "upload": {Data: map[string]any{"upload_mbps": 500.0}}}
+	m := speedBudgetAssessment(values, 1<<30)
+	if m.Data["estimated_full_test_mib"] == nil || m.Status == "ok" {
+		t.Fatal(m)
+	}
+}
+
+var _ io.Reader = (*stalledBody)(nil)
+
+func TestPairedLoadUsesSeparateControlSession(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := node.NewServer("0123456789abcdef0123456789abcdef", udp.LocalAddr().(*net.UDPAddr).Port, 64<<20)
+	server := httptest.NewTLSServer(service)
+	defer server.Close()
+	c, err := node.NewClient(server.URL, service.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.HTTP.Transport = server.Client().Transport
+	if err = c.Open(context.Background(), 32<<20, 30); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	control, err := c.NewSession(context.Background(), 1<<20, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.ServeUDP(ctx, udp) }()
+	defer func() { cancel(); udp.Close(); <-done }()
+	load, latency, _ := pairedLoad(context.Background(), c, control, "download", 4*time.Second, NewBudget(1<<20), 1<<20, 128<<10, "")
+	if load.Status != "ok" || load.Data["full_interval"] != true || latency.Stats == nil || latency.Stats.Received < 30 {
+		t.Fatalf("load=%+v latency=%+v", load, latency)
 	}
 }

@@ -34,7 +34,7 @@ func LoadedLatency(idle, loaded, load Measurement, phase string) Measurement {
 func PacketSizeAssessment(values []Measurement, peer string) Measurement {
 	m := Measurement{ID: "packet-size-assessment", Kind: "path_mtu", Target: peer, Status: "unavailable", Reason: "no_fragmentation_control_or_successful_probes", Data: map[string]any{"exact_pmtu_known": false}}
 	maxPayload := 0
-	minFailed := 0
+	failedSizes := map[int]int{}
 	for _, value := range values {
 		if value.Kind != "packet_size" || value.Data["fragmentation"] != "disabled" || value.Stats == nil || value.Stats.Sent < 10 || value.Status == "partial" || value.Status == "limited" {
 			continue
@@ -43,8 +43,8 @@ func PacketSizeAssessment(values []Measurement, peer string) Measurement {
 		if value.Stats.Received >= 10 && size > maxPayload {
 			maxPayload = size
 		}
-		if value.Stats.Received == 0 && (minFailed == 0 || size < minFailed) {
-			minFailed = size
+		if value.Stats.Received == 0 && value.Stats.LocalErrors == 0 {
+			failedSizes[size]++
 		}
 	}
 	if maxPayload == 0 {
@@ -53,7 +53,33 @@ func PacketSizeAssessment(values []Measurement, peer string) Measurement {
 	m.Status = "ok"
 	m.Reason = ""
 	m.Data["largest_confirmed_udp_payload_bytes"] = maxPayload
-	m.Data["large_packets_failed"] = minFailed > maxPayload
+	largeFailed := false
+	for size, count := range failedSizes {
+		if size > maxPayload && count >= 2 {
+			largeFailed = true
+		}
+	}
+	m.Data["large_packets_failed"] = largeFailed
+	m.Data["failed_size_rounds"] = failedSizes
 	m.Data["interpretation"] = "Подтверждён только проходящий размер. Потери более крупных проб не определяют точный PMTU и не устанавливают причину."
 	return m
+}
+
+func AssessRecovery(comparison *Measurement, idle, recovery Measurement) {
+	comparison.Data["recovery_measurement_id"] = recovery.ID
+	a := SteadyStats(idle, 5*time.Second)
+	b := SteadyStats(recovery, 3*time.Second)
+	if comparison.Status != "ok" {
+		return
+	}
+	if recovery.Status != "ok" || recovery.Kind != "udp_rtt" || recovery.Target != idle.Target || b.Received < 50 {
+		comparison.Status = "inconclusive"
+		comparison.Reason = "recovery_not_measured"
+		return
+	}
+	comparison.Data["recovery_p95_ms"] = b.P95
+	if b.P95 > a.P95+max(10, number(comparison.Data["p95_increase_ms"])*0.5) {
+		comparison.Status = "inconclusive"
+		comparison.Reason = "latency_did_not_recover"
+	}
 }
