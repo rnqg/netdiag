@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="384" viewBox="0 0 680 384" role="img" aria-labelledby="title">
+  <title id="title">netdiag terminal output</title>
+  <rect x="1" y="1" width="678" height="382" rx="12" fill="#182720" stroke="#516258" stroke-width="2"/>
+  <path d="M1 44h678" stroke="#42584a"/>
+  <g fill="#8da89a"><circle cx="24" cy="23" r="3"/><circle cx="37" cy="23" r="3"/><circle cx="50" cy="23" r="3"/></g>
+  <text x="340" y="28" font-family="Menlo, Consolas, monospace" font-size="13" text-anchor="middle" fill="#bdcdc2">netdiag</text>
+  <g font-family="Menlo, Consolas, monospace" font-size="17" fill="#edf2ed" xml:space="preserve">
+    <text x="24" y="72" fill="#b6e8bd">$ ./netdiag check --mode direct --profile quick \</text>
+    <text x="24" y="94" fill="#b6e8bd">    --only-target --target example.org</text>
+    <text x="24" y="138" fill="#b6e8bd">https://example.org/ — ответ получен</text>
+    <text x="24" y="182" fill="#ccdacf">icmp_rtt: example.org</text>
+    <text x="24" y="204">Ответы: 0/5, без ответа: 100.0%</text>
+    <text x="24" y="226" fill="#f1c48f">RTT не измерен.</text>
+    <text x="24" y="270" fill="#ccdacf">icmp_rtt: local-gateway</text>
+    <text x="24" y="292">Ответы: 3/3, без ответа: 0.0%</text>
+    <text x="24" y="314">Медиана RTT: 2.38 мс, p95: 2.59 мс</text>
+    <text x="24" y="336">Джиттер RTT: 0.21 мс</text>
+    <text x="24" y="358" fill="#ccdacf">Системный DNS — ответ получен: 1</text>
+  </g>
+</svg>
