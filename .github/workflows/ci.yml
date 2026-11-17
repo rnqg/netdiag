@@ -52,4 +52,8 @@ jobs:
           if [ -n "$TASK_TEMP" ] && [ -d "$TASK_TEMP" ]; then
             chmod -R u+w "$TASK_TEMP"
             rm -rf "$TASK_TEMP"
+            echo "GOTMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+            echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+            echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+            echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
           fi

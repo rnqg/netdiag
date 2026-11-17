@@ -92,3 +92,12 @@ func TestComparisonIncludesReasonsAndTiming(t *testing.T) {
 		t.Fatal(m)
 	}
 }
+
+func TestGatewayDoesNotSubstituteForTargetQuality(t *testing.T) {
+	r := diag.Report{Command: "quality", Measurements: []diag.Measurement{{Kind: "icmp_rtt", Target: "example.org", Status: "failed", Stats: &diag.Statistics{Sent: 2, Lost: 2}}, {Kind: "icmp_rtt", Target: "local-gateway", Status: "ok", Stats: &diag.Statistics{Sent: 2, Received: 2}}}}
+	r.Findings = diag.Analyze(r)
+	var out, errOut bytes.Buffer
+	if code := emit(&out, &errOut, r, "text", "", false); code == 0 {
+		t.Fatal("gateway replies substituted for target RTT")
+	}
+}

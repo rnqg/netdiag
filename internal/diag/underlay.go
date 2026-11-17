@@ -83,14 +83,7 @@ func discoverPhysical(ctx context.Context, e *Environment) {
 				return
 			}
 		}
-	case "windows":
-		script := "$ids=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | ForEach-Object {$_.ifIndex}); Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object {$ids -contains $_.InterfaceIndex} | Sort-Object RouteMetric | Select-Object -First 1 InterfaceAlias,NextHop | ConvertTo-Json -Compress"
-		b, err := SystemCommand(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
-		var r struct{ InterfaceAlias, NextHop string }
-		if err == nil && json.Unmarshal(b, &r) == nil && validGateway(r.NextHop) {
-			e.PhysicalInterface = r.InterfaceAlias
-			e.PhysicalGateway = r.NextHop
-		}
+
 	}
 }
 

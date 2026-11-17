@@ -116,27 +116,7 @@ func Inspect() Environment {
 			}
 		}
 	case "windows":
-		script := `$ErrorActionPreference='Stop'; $metrics=@{}; Get-NetIPInterface -AddressFamily IPv4 | ForEach-Object {$metrics[[int]$_.InterfaceIndex]=[int]$_.InterfaceMetric}; $routes=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Sort-Object @{Expression={[int]$_.RouteMetric+$metrics[[int]$_.InterfaceIndex]}}); $r=$routes | Select-Object -First 1; $ids=@(Get-NetAdapter -Physical | ForEach-Object {$_.ifIndex}); $physical=$routes | Where-Object {$ids -contains $_.InterfaceIndex} | Select-Object -First 1; $proxy=Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue; $dns=@(Get-DnsClientServerAddress | Sort-Object InterfaceIndex,AddressFamily | Select-Object InterfaceIndex,AddressFamily,ServerAddresses); [pscustomobject]@{Gateway=$r.NextHop;Interface=$r.InterfaceAlias;PhysicalGateway=$physical.NextHop;PhysicalInterface=$physical.InterfaceAlias;Proxy=[int](($proxy.ProxyEnable -eq 1) -or [bool]$proxy.AutoConfigURL);DNS=$dns} | ConvertTo-Json -Depth 5 -Compress`
-		b, err := SystemCommand(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
-		if err == nil {
-			var v struct {
-				Gateway, Interface, PhysicalGateway, PhysicalInterface string
-				Proxy                                                  int
-				DNS                                                    json.RawMessage
-			}
-			if json.Unmarshal(b, &v) == nil {
-				e.Gateway = v.Gateway
-				e.ActiveInterface = v.Interface
-				e.PhysicalGateway = v.PhysicalGateway
-				e.PhysicalInterface = v.PhysicalInterface
-				e.ProxyHint = e.ProxyHint || v.Proxy == 1
-				e.ProxyStateKnown = true
-				if len(v.DNS) > 0 {
-					hash := sha256.Sum256(v.DNS)
-					e.DNSFingerprint = hex.EncodeToString(hash[:])
-				}
-			}
-		}
+		inspectWindows(ctx, &e)
 	}
 	discoverPhysical(ctx, &e)
 	if e.DNSFingerprint == "" {

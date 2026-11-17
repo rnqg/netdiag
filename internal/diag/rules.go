@@ -11,7 +11,7 @@ func Analyze(r Report) []Finding {
 		received := 0
 		var evidence []string
 		for _, m := range r.Measurements {
-			if m.Kind == "udp_rtt" || m.Kind == "icmp_rtt" {
+			if (m.Kind == "udp_rtt" || m.Kind == "icmp_rtt") && m.Target != "local-gateway" {
 				evidence = append(evidence, m.ID)
 				if m.Stats != nil {
 					received += m.Stats.Received
@@ -19,7 +19,7 @@ func Analyze(r Report) []Finding {
 			}
 		}
 		if received == 0 {
-			f = append(f, Finding{Code: "quality_not_measured", Severity: "error", Confidence: "observed", Summary: "Качество соединения не измерено", Evidence: evidence, Next: "Нет успешных RTT-проб. Проверьте доступность измерительного узла и причины отказов; это не доказывает отсутствие интернета."})
+			f = append(f, Finding{Code: "quality_not_measured", Severity: "error", Confidence: "observed", Summary: "Качество соединения не измерено", Evidence: evidence, Next: "Нет успешных RTT-проб выбранной цели; ответы локального шлюза учитываются отдельно. Проверьте доступность измерительного узла и причины отказов; это не доказывает отсутствие интернета."})
 		}
 	}
 	dnsFailures := map[string][]string{}
