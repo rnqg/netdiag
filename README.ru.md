@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="#установка">Установка</a> · <a href="#запуск">Запуск</a> · <a href="docs/guide.ru.md">Руководство</a> · <a href="README.md">English</a>
+  <a href="https://github.com/rnqg/netdiag/releases/latest">Скачать</a> · <a href="#установка">Установка</a> · <a href="#запуск">Запуск</a> · <a href="docs/guide.ru.md">Руководство</a> · <a href="README.md">English</a>
 </p>
 
 <p align="center">
@@ -21,7 +21,22 @@ netdiag показывает эти результаты отдельно и и�
 
 ## Установка
 
-Сборка из исходников с Go 1.27.4 или новее. Поддерживаются amd64 и arm64.
+Скачайте архив для своей системы и распакуйте его. Go нужен только для сборки из исходников.
+
+| Система | x86-64 | ARM64 |
+| --- | --- | --- |
+| Windows | [.zip](https://github.com/rnqg/netdiag/releases/latest/download/netdiag-windows-amd64.zip) | [.zip](https://github.com/rnqg/netdiag/releases/latest/download/netdiag-windows-arm64.zip) |
+| macOS | [Intel](https://github.com/rnqg/netdiag/releases/latest/download/netdiag-macos-amd64.tar.gz) | [Apple Silicon](https://github.com/rnqg/netdiag/releases/latest/download/netdiag-macos-arm64.tar.gz) |
+| Linux | [.tar.gz](https://github.com/rnqg/netdiag/releases/latest/download/netdiag-linux-amd64.tar.gz) | [.tar.gz](https://github.com/rnqg/netdiag/releases/latest/download/netdiag-linux-arm64.tar.gz) |
+
+В архиве есть клиент `netdiag` и измерительный узел `netdiag-node`. Откройте терминал в распакованной папке и выполните `./netdiag --help`. В PowerShell на Windows выполните `.\netdiag.exe --help`.
+
+[Последний релиз](https://github.com/rnqg/netdiag/releases/latest) · [Контрольные суммы SHA-256](https://github.com/rnqg/netdiag/releases/latest/download/SHA256SUMS)
+
+<details>
+<summary>Сборка из исходников</summary>
+
+Нужен Go 1.27.4 или новее.
 
 ```sh
 git clone https://github.com/rnqg/netdiag.git
@@ -30,6 +45,8 @@ go build -o netdiag ./cmd/netdiag
 ```
 
 На Windows соберите через `go build -o netdiag.exe ./cmd/netdiag` и запускайте `.\netdiag.exe` в PowerShell.
+
+</details>
 
 ## Запуск
 
